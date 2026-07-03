@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Circuit Simulator</title>
+  <meta name="description" content="Interactive analog circuit simulator with a schematic editor — resistors, capacitors, inductors, diodes, LEDs, and live current animation.">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <header>
+    <h1>⚡ Circuit Simulator</h1>
+    <div class="toolbar">
+      <button id="runBtn" class="btn">⏸ Pause</button>
+      <button id="resetBtn" class="btn" title="Reset time and capacitor/inductor states">↺ Reset</button>
+      <label class="ctl">Speed
+        <input type="range" id="speed" min="0" max="100" value="62">
+      </label>
+      <label class="ctl">Δt
+        <input type="text" id="dtInput" size="6" title="Simulation time step (e.g. 50µ)">
+      </label>
+      <select id="examples" title="Load an example circuit">
+        <option value="">Examples…</option>
+      </select>
+      <span class="sep"></span>
+      <button id="undoBtn" class="btn" title="Undo (Ctrl+Z)">↶</button>
+      <button id="redoBtn" class="btn" title="Redo (Ctrl+Y)">↷</button>
+      <button id="clearBtn" class="btn" title="Clear the canvas">🗑 Clear</button>
+      <span class="sep"></span>
+      <button id="exportBtn" class="btn" title="Download circuit as JSON">⤓ Export</button>
+      <button id="importBtn" class="btn" title="Load circuit from JSON">⤒ Import</button>
+      <input type="file" id="importFile" accept=".json,application/json" hidden>
+      <button id="helpBtn" class="btn" title="Help">?</button>
+    </div>
+  </header>
+
+  <main>
+    <aside id="palette"></aside>
+    <div id="canvas-wrap">
+      <canvas id="canvas"></canvas>
+    </div>
+    <aside id="inspector">
+      <h2>Inspector</h2>
+      <div id="inspector-body"></div>
+    </aside>
+  </main>
+
+  <footer>
+    <span id="status-hint"></span>
+    <span id="status-time"></span>
+  </footer>
+
+  <div id="help" class="hidden">
+    <div class="help-card">
+      <h2>How to use</h2>
+      <ul>
+        <li><b>Place parts:</b> pick a component in the palette, then click or drag on the canvas. Terminals snap to the grid — parts connect when their endpoints share a grid point.</li>
+        <li><b>Wire things up</b> with the Wire tool. Every circuit needs a <b>Ground</b>.</li>
+        <li><b>Select / Move:</b> click to select, drag to move, drag the blue endpoint handles to reshape. Click a <b>switch</b> to toggle it.</li>
+        <li><b>Edit values</b> in the Inspector (double-click a part to jump there). Engineering notation works: <code>4.7k</code>, <code>10µ</code>, <code>100n</code>.</li>
+        <li><b>Watch it run:</b> wire color shows node voltage (green +, red −), moving yellow dots show current flow. Select a part to see its live V/I trace on the mini-scope.</li>
+      </ul>
+      <h2>Shortcuts</h2>
+      <ul>
+        <li><b>R</b> rotate · <b>Del</b> delete · <b>Esc</b> select tool · <b>Space</b> run/pause · <b>Ctrl+Z / Ctrl+Y</b> undo/redo</li>
+      </ul>
+      <p class="muted">Click anywhere outside this card to close.</p>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
