@@ -55,8 +55,9 @@
     <div class="help-card">
       <h2>How to use</h2>
       <ul>
-        <li><b>Place parts:</b> pick a component in the palette, then click or drag on the canvas. Terminals snap to the grid — parts connect when their endpoints share a grid point.</li>
+        <li><b>Place parts:</b> pick a component in the palette, then click or drag on the canvas. Terminals snap to the grid — parts connect when their endpoints share a grid point. A <b>filled dot</b> marks a connection; a <b>red ring</b> marks an unconnected pin. While dragging, <b>green rings</b> show where terminals will connect.</li>
         <li><b>Wire things up</b> with the Wire tool. Every circuit needs a <b>Ground</b>.</li>
+        <li><b>MOSFETs</b> (NMOS/PMOS) have three pins — Gate, Drain, Source (labeled when selected). Drag while placing to set the orientation; <b>R</b> rotates around the gate.</li>
         <li><b>Select / Move:</b> click to select, drag to move, drag the blue endpoint handles to reshape. Click a <b>switch</b> to toggle it.</li>
         <li><b>Edit values</b> in the Inspector (double-click a part to jump there). Engineering notation works: <code>4.7k</code>, <code>10µ</code>, <code>100n</code>.</li>
         <li><b>Watch it run:</b> wire color shows node voltage (green +, red −), moving yellow dots show current flow. Select a part to see its live V/I trace on the mini-scope.</li>

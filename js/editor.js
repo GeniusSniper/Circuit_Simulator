@@ -1,8 +1,12 @@
 // editor.js — interactive schematic editor on a <canvas>.
 // Handles grid snapping, component placement, selection, moving,
-// endpoint reshaping, switch toggling, undo/redo, and rendering.
+// endpoint reshaping, switch toggling, undo/redo, and rendering
+// (including junction dots and drag-to-connect highlights).
 
-import { CELL, DEFS, makeComponent, renderComponent, drawShape, voltageColor, formatValue } from './components.js';
+import {
+  CELL, DEFS, makeComponent, renderComponent, drawShape, drawMosfet,
+  voltageColor, isMos, mosfetFootprint,
+} from './components.js';
 
 const HIT_DIST = 6;
 const DOT_SPACING = 14;
@@ -24,6 +28,28 @@ function snapDir(x0, y0, gx, gy) {
   if (ady >= 2 * adx) return { x: x0, y: gy };
   const m = Math.max(1, Math.round((adx + ady) / 2));
   return { x: x0 + Math.sign(dx) * m, y: y0 + Math.sign(dy) * m };
+}
+
+// Cardinal direction of a drag vector (for MOSFET orientation).
+function cardinalDir(x0, y0, gx, gy) {
+  const dx = gx - x0, dy = gy - y0;
+  if (dx === 0 && dy === 0) return 'e';
+  return Math.abs(dx) >= Math.abs(dy) ? (dx >= 0 ? 'e' : 'w') : (dy >= 0 ? 's' : 'n');
+}
+
+// Grid-space terminal points of a component, paired with their solved voltages.
+export function terminalsOf(c) {
+  if (c.type === 'ground') return [[c.x1, c.y1, c._v1]];
+  if (isMos(c.type)) return [[c.x1, c.y1, c._v1], [c.x2, c.y2, c._v2], [c.x3, c.y3, c._v3]];
+  return [[c.x1, c.y1, c._v1], [c.x2, c.y2, c._v2]];
+}
+
+const PERSISTED = ['value', 'freq', 'closed', 'offset', 'x3', 'y3'];
+
+function makeFromObj(o) {
+  const c = makeComponent(o.type, o.x1, o.y1, o.x2, o.y2);
+  for (const k of PERSISTED) if (o[k] !== undefined) c[k] = o[k];
+  return c;
 }
 
 export class Editor {
@@ -74,9 +100,7 @@ export class Editor {
       version: 1,
       components: this.components.map(c => {
         const o = { type: c.type, x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 };
-        if (c.value !== undefined) o.value = c.value;
-        if (c.freq !== undefined) o.freq = c.freq;
-        if (c.closed !== undefined) o.closed = c.closed;
+        for (const k of PERSISTED) if (c[k] !== undefined) o[k] = c[k];
         return o;
       }),
     });
@@ -84,11 +108,7 @@ export class Editor {
 
   load(data) {
     const obj = typeof data === 'string' ? JSON.parse(data) : data;
-    this.components = (obj.components || []).map(o =>
-      Object.assign(makeComponent(o.type, o.x1, o.y1, o.x2, o.y2),
-        o.value !== undefined ? { value: o.value } : null,
-        o.freq !== undefined ? { freq: o.freq } : null,
-        o.closed !== undefined ? { closed: o.closed } : null));
+    this.components = (obj.components || []).map(makeFromObj);
     this.select(null);
     this.changed();
   }
@@ -112,12 +132,7 @@ export class Editor {
   }
 
   loadSnapshot(json) {
-    const obj = JSON.parse(json);
-    this.components = obj.components.map(o =>
-      Object.assign(makeComponent(o.type, o.x1, o.y1, o.x2, o.y2),
-        o.value !== undefined ? { value: o.value } : null,
-        o.freq !== undefined ? { freq: o.freq } : null,
-        o.closed !== undefined ? { closed: o.closed } : null));
+    this.components = JSON.parse(json).components.map(makeFromObj);
     this.select(null);
     this.changed();
   }
@@ -150,10 +165,17 @@ export class Editor {
     const c = this.selection;
     if (!c) return;
     this.pushUndo();
-    const mx = (c.x1 + c.x2) / 2, my = (c.y1 + c.y2) / 2;
-    const r = (x, y) => ({ x: Math.round(mx + (my - y)), y: Math.round(my + (x - mx)) });
-    const p1 = r(c.x1, c.y1), p2 = r(c.x2, c.y2);
-    c.x1 = p1.x; c.y1 = p1.y; c.x2 = p2.x; c.y2 = p2.y;
+    if (isMos(c.type)) {
+      // rotate drain/source 90° clockwise around the gate
+      const rot = (x, y) => ({ x: c.x1 - (y - c.y1), y: c.y1 + (x - c.x1) });
+      const d = rot(c.x2, c.y2), s = rot(c.x3, c.y3);
+      c.x2 = d.x; c.y2 = d.y; c.x3 = s.x; c.y3 = s.y;
+    } else {
+      const mx = (c.x1 + c.x2) / 2, my = (c.y1 + c.y2) / 2;
+      const rot = (x, y) => ({ x: Math.round(mx + (my - y)), y: Math.round(my + (x - mx)) });
+      const p1 = rot(c.x1, c.y1), p2 = rot(c.x2, c.y2);
+      c.x1 = p1.x; c.y1 = p1.y; c.x2 = p2.x; c.y2 = p2.y;
+    }
     this.changed();
   }
 
@@ -162,13 +184,20 @@ export class Editor {
   hitTest(mx, my) {
     for (let i = this.components.length - 1; i >= 0; i--) {
       const c = this.components[i];
-      if (segDist(mx, my, c.x1 * CELL, c.y1 * CELL, c.x2 * CELL, c.y2 * CELL) < HIT_DIST) return c;
+      if (isMos(c.type)) {
+        const cx = (c.x2 + c.x3) / 2 * CELL, cy = (c.y2 + c.y3) / 2 * CELL;
+        if (segDist(mx, my, c.x1 * CELL, c.y1 * CELL, cx, cy) < HIT_DIST ||
+            segDist(mx, my, c.x2 * CELL, c.y2 * CELL, cx, cy) < HIT_DIST ||
+            segDist(mx, my, c.x3 * CELL, c.y3 * CELL, cx, cy) < HIT_DIST) return c;
+      } else if (segDist(mx, my, c.x1 * CELL, c.y1 * CELL, c.x2 * CELL, c.y2 * CELL) < HIT_DIST) {
+        return c;
+      }
     }
     return null;
   }
 
   hitEndpoint(mx, my, c) {
-    if (!c) return 0;
+    if (!c || isMos(c.type)) return 0; // MOSFET footprint is rigid — move/rotate only
     if (Math.hypot(mx - c.x1 * CELL, my - c.y1 * CELL) < HIT_DIST + 2) return 1;
     if (c.type !== 'ground' && Math.hypot(mx - c.x2 * CELL, my - c.y2 * CELL) < HIT_DIST + 2) return 2;
     return 0;
@@ -195,7 +224,7 @@ export class Editor {
         this.pushUndo();
         this.drag = {
           kind: 'move', c, start: g, moved: false,
-          orig: { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2 },
+          orig: { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, x3: c.x3, y3: c.y3 },
         };
       }
     } else {
@@ -216,14 +245,16 @@ export class Editor {
     }
 
     if (d.kind === 'place') {
-      d.g2 = d.type === 'ground'
+      d.g2 = (d.type === 'ground' || isMos(d.type))
         ? g
         : snapDir(d.g1.x, d.g1.y, g.x, g.y);
     } else if (d.kind === 'move') {
       const ddx = g.x - d.start.x, ddy = g.y - d.start.y;
       if (ddx || ddy) d.moved = true;
-      d.c.x1 = d.orig.x1 + ddx; d.c.y1 = d.orig.y1 + ddy;
-      d.c.x2 = d.orig.x2 + ddx; d.c.y2 = d.orig.y2 + ddy;
+      const c = d.c;
+      c.x1 = d.orig.x1 + ddx; c.y1 = d.orig.y1 + ddy;
+      c.x2 = d.orig.x2 + ddx; c.y2 = d.orig.y2 + ddy;
+      if (isMos(c.type)) { c.x3 = d.orig.x3 + ddx; c.y3 = d.orig.y3 + ddy; }
     } else if (d.kind === 'endpoint') {
       const c = d.c;
       const fx = d.end === 1 ? c.x2 : c.x1;
@@ -241,17 +272,18 @@ export class Editor {
 
     if (d.kind === 'place') {
       let { g1, g2 } = d;
+      this.pushUndo();
       if (d.type === 'ground') {
         if (g1.x === g2.x && g1.y === g2.y) g2 = { x: g1.x, y: g1.y + 1 };
-        this.pushUndo();
         this.components.push(makeComponent('ground', g1.x, g1.y, g2.x, g2.y));
-        this.changed();
-        return;
+      } else if (isMos(d.type)) {
+        const c = makeComponent(d.type, g1.x, g1.y, 0, 0);
+        Object.assign(c, mosfetFootprint(g1.x, g1.y, cardinalDir(g1.x, g1.y, g2.x, g2.y)));
+        this.components.push(c);
+      } else {
+        if (g1.x === g2.x && g1.y === g2.y) g2 = { x: g1.x + 4, y: g1.y }; // plain click → default footprint
+        this.components.push(makeComponent(d.type, g1.x, g1.y, g2.x, g2.y));
       }
-      if (g1.x === g2.x && g1.y === g2.y) g2 = { x: g1.x + 4, y: g1.y }; // plain click → default footprint
-      this.pushUndo();
-      const c = makeComponent(d.type, g1.x, g1.y, g2.x, g2.y);
-      this.components.push(c);
       this.changed();
     } else if (d.kind === 'move' && !d.moved) {
       // A clean click: undo snapshot wasn't needed for a move,
@@ -305,13 +337,18 @@ export class Editor {
       renderComponent(ctx, c, vScale, c === this.selection);
     }
 
+    this.drawJunctions(ctx, vScale);
+
     // current dots
     if (running) this.advanceDots(frameDt);
     ctx.fillStyle = '#ffd24a';
     for (const c of this.components) {
       if (c.type === 'ground' || !c._i || Math.abs(c._i) < 1e-7) continue;
-      const x1 = c.x1 * CELL, y1 = c.y1 * CELL;
-      const x2 = c.x2 * CELL, y2 = c.y2 * CELL;
+      // MOSFET channel current flows drain → source
+      const [ax, ay, bx, by] = isMos(c.type)
+        ? [c.x2, c.y2, c.x3, c.y3]
+        : [c.x1, c.y1, c.x2, c.y2];
+      const x1 = ax * CELL, y1 = ay * CELL, x2 = bx * CELL, y2 = by * CELL;
       const len = Math.hypot(x2 - x1, y2 - y1);
       if (len < 2) continue;
       const ux = (x2 - x1) / len, uy = (y2 - y1) / len;
@@ -325,26 +362,99 @@ export class Editor {
 
     // selection endpoint handles
     if (this.selection) {
-      const c = this.selection;
       ctx.fillStyle = '#579dff';
-      const pts = c.type === 'ground' ? [[c.x1, c.y1]] : [[c.x1, c.y1], [c.x2, c.y2]];
-      for (const [gx, gy] of pts) {
+      for (const [gx, gy] of terminalsOf(this.selection)) {
         ctx.fillRect(gx * CELL - 3.5, gy * CELL - 3.5, 7, 7);
       }
     }
+
+    this.drawConnectHints(ctx);
 
     // placement ghost
     const d = this.drag;
     if (d && d.kind === 'place') {
       ctx.globalAlpha = 0.55;
-      drawShape(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
-        (d.g1.x === d.g2.x && d.g1.y === d.g2.y && d.type !== 'ground' ? d.g1.x + 4 : d.g2.x) * CELL,
-        (d.type === 'ground' && d.g1.x === d.g2.x && d.g1.y === d.g2.y ? d.g1.y + 1 : d.g2.y) * CELL,
-        {});
+      if (isMos(d.type)) {
+        const f = mosfetFootprint(d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
+        drawMosfet(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
+          f.x2 * CELL, f.y2 * CELL, f.x3 * CELL, f.y3 * CELL, {});
+      } else {
+        drawShape(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
+          (d.g1.x === d.g2.x && d.g1.y === d.g2.y && d.type !== 'ground' ? d.g1.x + 4 : d.g2.x) * CELL,
+          (d.type === 'ground' && d.g1.x === d.g2.x && d.g1.y === d.g2.y ? d.g1.y + 1 : d.g2.y) * CELL,
+          {});
+      }
       ctx.globalAlpha = 1;
     }
 
     ctx.restore();
+  }
+
+  // Filled dots where 2+ terminals join (colored by node voltage);
+  // faint red rings on unconnected terminals.
+  drawJunctions(ctx, vScale) {
+    const points = new Map(); // "x,y" -> { x, y, count, v }
+    for (const c of this.components) {
+      for (const [gx, gy, v] of terminalsOf(c)) {
+        const k = gx + ',' + gy;
+        const p = points.get(k);
+        if (p) { p.count++; if (p.v === undefined) p.v = v; }
+        else points.set(k, { x: gx, y: gy, count: 1, v });
+      }
+    }
+    for (const p of points.values()) {
+      if (p.count >= 2) {
+        ctx.fillStyle = voltageColor(p.v, vScale);
+        ctx.beginPath();
+        ctx.arc(p.x * CELL, p.y * CELL, 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.strokeStyle = 'rgba(255,110,110,0.55)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(p.x * CELL, p.y * CELL, 3.2, 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+  }
+
+  // While dragging, ring the points where the dragged terminals will connect.
+  drawConnectHints(ctx) {
+    const d = this.drag;
+    if (!d) return;
+    let active = [];
+    let exclude = null;
+    if (d.kind === 'move') {
+      active = terminalsOf(d.c).map(([x, y]) => [x, y]);
+      exclude = d.c;
+    } else if (d.kind === 'endpoint') {
+      const c = d.c;
+      active = [d.end === 1 ? [c.x1, c.y1] : [c.x2, c.y2]];
+      exclude = c;
+    } else if (d.kind === 'place') {
+      if (isMos(d.type)) {
+        const f = mosfetFootprint(d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
+        active = [[d.g1.x, d.g1.y], [f.x2, f.y2], [f.x3, f.y3]];
+      } else if (d.type === 'ground') {
+        active = [[d.g1.x, d.g1.y]];
+      } else {
+        active = [[d.g1.x, d.g1.y], [d.g2.x, d.g2.y]];
+      }
+    }
+    if (!active.length) return;
+    const others = new Set();
+    for (const c of this.components) {
+      if (c === exclude) continue;
+      for (const [gx, gy] of terminalsOf(c)) others.add(gx + ',' + gy);
+    }
+    ctx.strokeStyle = '#3ddc84';
+    ctx.lineWidth = 2;
+    for (const [gx, gy] of active) {
+      if (!others.has(gx + ',' + gy)) continue;
+      ctx.beginPath();
+      ctx.arc(gx * CELL, gy * CELL, 6, 0, Math.PI * 2);
+      ctx.stroke();
+    }
   }
 
   advanceDots(frameDt) {

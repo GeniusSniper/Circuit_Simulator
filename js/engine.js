@@ -12,14 +12,48 @@ const VT = 0.025852;      // thermal voltage at room temperature
 
 const DIODE_PARAMS = { is: 1e-9, n: 1.5 };   // Vf ~ 0.65 V at 10 mA
 const LED_PARAMS = { is: 1e-18, n: 2.0 };    // Vf ~ 1.9 V at 10 mA
+const MOS_K = 0.02;                          // transconductance parameter (A/V²)
 
 export function isVoltageLike(c) {
   return c.type === 'vsource' || c.type === 'acsource' || c.type === 'ground' ||
     c.type === 'wire' || (c.type === 'switch' && c.closed);
 }
 
-function isNonlinear(c) {
-  return c.type === 'diode' || c.type === 'led';
+export function isMosfet(c) {
+  return c.type === 'nmos' || c.type === 'pmos';
+}
+
+// Square-law MOSFET operating point. Terminals: _a = gate, _b = drain, _c = source.
+// Symmetric conduction: if the actual drain-source voltage is negative (for the
+// device polarity), drain and source swap roles. PMOS is an NMOS with all
+// voltages negated. Returns everything in the effective (swapped) frame, where
+// the linearized drain current in terms of ACTUAL node voltages is:
+//   Id ≈ gm·Vg + gds·Vd − (gm+gds)·Vs + Ieq
+export function mosOP(c, Vg, Vd, Vs) {
+  const pol = c.type === 'pmos' ? -1 : 1;
+  const vth = typeof c.value === 'number' ? Math.abs(c.value) : 1.5;
+  let d = c._b, s = c._c, reversed = false;
+  if (pol * (Vd - Vs) < 0) {
+    const tn = d; d = s; s = tn;
+    const tv = Vd; Vd = Vs; Vs = tv;
+    reversed = true;
+  }
+  const vgs = pol * (Vg - Vs);
+  const vds = pol * (Vd - Vs);
+  const ov = vgs - vth;
+  let id, gm, gds;
+  if (ov <= 0) {                 // cutoff
+    id = 0; gm = 0; gds = 1e-9;
+  } else if (vds < ov) {         // linear / triode
+    id = MOS_K * (ov * vds - vds * vds / 2);
+    gm = MOS_K * vds;
+    gds = MOS_K * (ov - vds) + 1e-9;
+  } else {                       // saturation
+    id = MOS_K / 2 * ov * ov;
+    gm = MOS_K * ov;
+    gds = 1e-8;
+  }
+  return { d, s, reversed, idEff: pol * id, gm, gds, Vd, Vs };
 }
 
 export function luFactor(A) {
@@ -90,21 +124,29 @@ export class Simulation {
 
     this.vsrcs = [];
     this.diodes = [];
+    this.mosfets = [];
     for (const c of comps) {
       c._a = nodeOf(c.x1, c.y1);
       c._b = c.type === 'ground' ? 0 : nodeOf(c.x2, c.y2);
+      c._c = isMosfet(c) ? nodeOf(c.x3, c.y3) : -1;
       c._vs = -1;
       if (isVoltageLike(c)) { c._vs = this.vsrcs.length; this.vsrcs.push(c); }
-      if (isNonlinear(c)) this.diodes.push(c);
+      if (c.type === 'diode' || c.type === 'led') {
+        this.diodes.push(c);
+        if (typeof c._vd !== 'number') c._vd = 0.6;
+      }
+      if (isMosfet(c)) {
+        this.mosfets.push(c);
+        if (typeof c._lvg !== 'number') { c._lvg = 0; c._lvd = 0; c._lvs = 0; }
+      }
       if (c.type === 'capacitor' && typeof c.state !== 'number') c.state = 0; // voltage across
       if (c.type === 'inductor' && typeof c.state !== 'number') c.state = 0; // current through
-      if (isNonlinear(c) && typeof c._vd !== 'number') c._vd = 0.6;
     }
 
     this.n = Math.max(0, next - 1); // non-reference node count
     this.m = this.vsrcs.length;
     this.size = this.n + this.m;
-    this.nonlinear = this.diodes.length > 0;
+    this.nonlinear = this.diodes.length > 0 || this.mosfets.length > 0;
     this.x = new Float64Array(this.size);
 
     this.buildBase();
@@ -143,7 +185,7 @@ export class Simulation {
 
   sourceVoltage(c, t) {
     if (c.type === 'vsource') return c.value;
-    if (c.type === 'acsource') return c.value * Math.sin(2 * Math.PI * (c.freq || 60) * t);
+    if (c.type === 'acsource') return (c.offset || 0) + c.value * Math.sin(2 * Math.PI * (c.freq || 60) * t);
     return 0; // ground, wire, closed switch
   }
 
@@ -187,10 +229,13 @@ export class Simulation {
 
   newton(z) {
     let x = this.x;
-    for (let iter = 0; iter < 80; iter++) {
+    const clamp = (v, lim) => Math.max(-lim, Math.min(lim, v));
+    for (let iter = 0; iter < 120; iter++) {
       const A = this.base.map(row => Float64Array.from(row));
       const zz = Float64Array.from(z);
       const st = (i, j, v) => { if (i > 0 && j > 0) A[i - 1][j - 1] += v; };
+      const inj = (i, v) => { if (i > 0) zz[i - 1] += v; };
+
       for (const c of this.diodes) {
         const { is, n } = this.diodeParams(c);
         const nvt = n * VT;
@@ -200,18 +245,35 @@ export class Simulation {
         const ieq = id - gd * c._vd;
         st(c._a, c._a, gd); st(c._b, c._b, gd);
         st(c._a, c._b, -gd); st(c._b, c._a, -gd);
-        if (c._a > 0) zz[c._a - 1] -= ieq;
-        if (c._b > 0) zz[c._b - 1] += ieq;
+        inj(c._a, -ieq);
+        inj(c._b, ieq);
       }
+
+      for (const c of this.mosfets) {
+        const g = c._a;
+        const { d, s, idEff, gm, gds, Vd, Vs } = mosOP(c, c._lvg, c._lvd, c._lvs);
+        const ieq = idEff - (gm * c._lvg + gds * Vd - (gm + gds) * Vs);
+        st(d, g, gm); st(d, d, gds); st(d, s, -(gm + gds));
+        st(s, g, -gm); st(s, d, -gds); st(s, s, gm + gds);
+        inj(d, -ieq);
+        inj(s, ieq);
+      }
+
       const piv = luFactor(A);
       x = luSolve(A, piv, zz);
       const V = id => (id > 0 ? x[id - 1] : 0);
       let maxDelta = 0;
       for (const c of this.diodes) {
-        const vNew = V(c._a) - V(c._b);
-        const d = vNew - c._vd;
-        maxDelta = Math.max(maxDelta, Math.abs(d));
-        c._vd += Math.max(-0.6, Math.min(0.6, d)); // damping keeps exp() from blowing up
+        const dv = V(c._a) - V(c._b) - c._vd;
+        maxDelta = Math.max(maxDelta, Math.abs(dv));
+        c._vd += clamp(dv, 0.6); // damping keeps exp() from blowing up
+      }
+      for (const c of this.mosfets) {
+        const dg = V(c._a) - c._lvg, dd = V(c._b) - c._lvd, ds = V(c._c) - c._lvs;
+        maxDelta = Math.max(maxDelta, Math.abs(dg), Math.abs(dd), Math.abs(ds));
+        c._lvg += clamp(dg, 1);
+        c._lvd += clamp(dd, 1);
+        c._lvs += clamp(ds, 1);
       }
       if (maxDelta < 1e-6) break;
     }
@@ -244,6 +306,13 @@ export class Simulation {
         case 'led': {
           const { is, n } = this.diodeParams(c);
           c._i = is * (Math.exp(Math.min(vd / (n * VT), 60)) - 1);
+          break;
+        }
+        case 'nmos':
+        case 'pmos': {
+          c._v3 = V(c._c);
+          const op = mosOP(c, c._v1, c._v2, c._v3);
+          c._i = op.reversed ? -op.idEff : op.idEff; // actual drain → source
           break;
         }
         case 'switch':

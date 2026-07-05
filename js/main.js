@@ -1,7 +1,10 @@
 // main.js — app bootstrap: toolbar, palette, inspector, and the simulation loop.
 
 import { Simulation } from './engine.js';
-import { CELL, DEFS, PALETTE, drawShape, formatValue, parseValue, componentLabel } from './components.js';
+import {
+  CELL, DEFS, PALETTE, drawShape, drawMosfet, isMos,
+  formatValue, parseValue, componentLabel,
+} from './components.js';
 import { Editor } from './editor.js';
 import { EXAMPLES } from './examples.js';
 
@@ -38,8 +41,14 @@ const editor = new Editor($('canvas'), {
       const parts = [DEFS[c.type].name];
       if (label) parts.push(label);
       if (c._v1 !== undefined) {
-        parts.push('V: ' + formatValue((c._v1 - c._v2) || 0, 'V'));
-        parts.push('I: ' + formatValue(c._i || 0, 'A'));
+        if (isMos(c.type)) {
+          parts.push('Vgs: ' + formatValue((c._v1 - c._v3) || 0, 'V'));
+          parts.push('Vds: ' + formatValue((c._v2 - c._v3) || 0, 'V'));
+          parts.push('Id: ' + formatValue(c._i || 0, 'A'));
+        } else {
+          parts.push('V: ' + formatValue((c._v1 - c._v2) || 0, 'V'));
+          parts.push('I: ' + formatValue(c._i || 0, 'A'));
+        }
       }
       setHint(parts.join('  ·  '));
     } else if (g && sim) {
@@ -97,6 +106,8 @@ function buildPalette() {
       ictx.fill();
     } else if (item.type === 'ground') {
       drawShape(ictx, 'ground', 22, 5, 22, 20, {});
+    } else if (isMos(item.type)) {
+      drawMosfet(ictx, item.type, 8, 13, 36, 3, 36, 23, {});
     } else {
       drawShape(ictx, item.type, 3, 13, 41, 13, { closed: false });
     }
@@ -162,6 +173,9 @@ function buildInspector(c) {
   if (c.freq !== undefined) {
     addField('Frequency (Hz)', () => formatValue(c.freq, ''), v => { c.freq = Math.max(0, v); });
   }
+  if (c.offset !== undefined) {
+    addField('DC Offset (V)', () => formatValue(c.offset, ''), v => { c.offset = v; });
+  }
   if (c.closed !== undefined) {
     const btn = document.createElement('button');
     btn.className = 'btn';
@@ -209,6 +223,17 @@ function updateLiveReadout() {
   const el = $('live-readout');
   if (!c || !el) return;
   if (c._v1 === undefined) { el.textContent = ''; return; }
+  if (isMos(c.type)) {
+    const vgs = (c._v1 - c._v3) || 0;
+    const vds = (c._v2 - c._v3) || 0;
+    const id = c._i || 0;
+    el.innerHTML =
+      `<div><span>V<sub>GS</sub></span><b>${formatValue(vgs, 'V')}</b></div>` +
+      `<div><span>V<sub>DS</sub></span><b>${formatValue(vds, 'V')}</b></div>` +
+      `<div><span>I<sub>D</sub></span><b>${formatValue(id, 'A')}</b></div>` +
+      `<div><span>Power</span><b>${formatValue(vds * id, 'W')}</b></div>`;
+    return;
+  }
   const v = (c._v1 - c._v2) || 0;
   const i = c._i || 0;
   el.innerHTML =
@@ -220,7 +245,8 @@ function updateLiveReadout() {
 function sampleScope() {
   const c = editor.selection;
   if (!c || c._v1 === undefined) return;
-  scopeHist.push({ v: (c._v1 - c._v2) || 0, i: c._i || 0 });
+  const v = isMos(c.type) ? (c._v2 - c._v3) : (c._v1 - c._v2); // MOSFET scope traces Vds
+  scopeHist.push({ v: v || 0, i: c._i || 0 });
   if (scopeHist.length > SCOPE_MAX) scopeHist.splice(0, scopeHist.length - SCOPE_MAX);
 }
 
@@ -284,8 +310,10 @@ function resetStates() {
   for (const c of editor.components) {
     if (c.type === 'capacitor' || c.type === 'inductor') c.state = 0;
     delete c._vd;
+    delete c._lvg; delete c._lvd; delete c._lvs;
     delete c._v1;
     delete c._v2;
+    delete c._v3;
     delete c._i;
     c._dot = 0;
   }

@@ -10,13 +10,33 @@ export const DEFS = {
   capacitor: { name: 'Capacitor', value: 10e-6, unit: 'F', valueLabel: 'Capacitance' },
   inductor: { name: 'Inductor', value: 0.1, unit: 'H', valueLabel: 'Inductance' },
   vsource: { name: 'Voltage Source (DC)', value: 5, unit: 'V', valueLabel: 'Voltage' },
-  acsource: { name: 'Voltage Source (AC)', value: 5, unit: 'V', valueLabel: 'Amplitude', freq: 60 },
+  acsource: { name: 'Voltage Source (AC)', value: 5, unit: 'V', valueLabel: 'Amplitude', freq: 60, offset: 0 },
   isource: { name: 'Current Source', value: 0.01, unit: 'A', valueLabel: 'Current' },
   ground: { name: 'Ground' },
   switch: { name: 'Switch', closed: false },
   diode: { name: 'Diode' },
   led: { name: 'LED' },
+  nmos: { name: 'NMOS Transistor', value: 1.5, unit: 'V', valueLabel: 'Threshold' },
+  pmos: { name: 'PMOS Transistor', value: 1.5, unit: 'V', valueLabel: 'Threshold' },
 };
+
+export function isMos(type) {
+  return type === 'nmos' || type === 'pmos';
+}
+
+// Rigid 3-terminal footprint: gate at (gx,gy), drain/source 3 cells along the
+// axis and ±2 cells perpendicular. dir is the axis direction: e/s/w/n.
+export function mosfetFootprint(gx, gy, dir = 'e') {
+  const rot = {
+    e: (x, y) => [x, y],
+    s: (x, y) => [-y, x],
+    w: (x, y) => [-x, -y],
+    n: (x, y) => [y, -x],
+  }[dir] || ((x, y) => [x, y]);
+  const [dx, dy] = rot(3, -2);
+  const [sx, sy] = rot(3, 2);
+  return { x2: gx + dx, y2: gy + dy, x3: gx + sx, y3: gy + sy };
+}
 
 export const PALETTE = [
   { type: 'select', name: 'Select / Move' },
@@ -27,6 +47,8 @@ export const PALETTE = [
   { type: 'vsource', name: 'DC Source' },
   { type: 'acsource', name: 'AC Source' },
   { type: 'isource', name: 'Current Src' },
+  { type: 'nmos', name: 'NMOS' },
+  { type: 'pmos', name: 'PMOS' },
   { type: 'diode', name: 'Diode' },
   { type: 'led', name: 'LED' },
   { type: 'switch', name: 'Switch' },
@@ -39,6 +61,8 @@ export function makeComponent(type, x1, y1, x2, y2) {
   if (d.value !== undefined) c.value = d.value;
   if (d.freq !== undefined) c.freq = d.freq;
   if (d.closed !== undefined) c.closed = d.closed;
+  if (d.offset !== undefined) c.offset = d.offset;
+  if (isMos(type)) Object.assign(c, mosfetFootprint(x1, y1, 'e'));
   return c;
 }
 
@@ -50,7 +74,7 @@ const PREFIXES = [
 ];
 
 export function formatValue(v, unit = '') {
-  if (v === 0) return '0 ' + unit;
+  if (!isFinite(v) || Math.abs(v) < 1e-15) return '0 ' + unit;
   const av = Math.abs(v);
   for (const [scale, prefix] of PREFIXES) {
     if (av >= scale * 0.99999) {
@@ -310,9 +334,78 @@ export function drawShape(ctx, type, x1, y1, x2, y2, opts = {}) {
   ctx.restore();
 }
 
+// Draws a MOSFET symbol from its three pixel terminals: gate g, drain d, source s.
+// The symbol is rigid: bars sit near the D/S midpoint, elbow leads reach the terminals.
+export function drawMosfet(ctx, type, gx, gy, dx, dy, sx, sy, opts = {}) {
+  const cg = opts.cg || BODY, cd = opts.cd || BODY, cs = opts.cs || BODY;
+  const mx = (dx + sx) / 2, my = (dy + sy) / 2;
+  const L = Math.hypot(mx - gx, my - gy) || 1;
+  const H = Math.hypot(dx - mx, dy - my) || 1;
+  const ang = Math.atan2(my - gy, mx - gx);
+
+  ctx.save();
+  ctx.translate(gx, gy);
+  ctx.rotate(ang);
+  ctx.lineWidth = LW;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  // which local side (±y) the drain sits on
+  const ldy = -Math.sin(ang) * (dx - gx) + Math.cos(ang) * (dy - gy);
+  const sd = ldy < 0 ? -1 : 1; // drain side
+  const gateBarX = L - 17;
+  const chX = L - 12;
+  const pmos = type === 'pmos';
+
+  // gate lead (+ inversion bubble for PMOS)
+  ctx.strokeStyle = cg;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(gateBarX - (pmos ? 9 : 1), 0);
+  ctx.stroke();
+  if (pmos) {
+    ctx.beginPath();
+    ctx.arc(gateBarX - 5, 0, 3.5, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  // gate bar
+  ctx.beginPath();
+  ctx.moveTo(gateBarX, -12);
+  ctx.lineTo(gateBarX, 12);
+  ctx.stroke();
+  // channel bar
+  ctx.strokeStyle = BODY;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(chX, -14);
+  ctx.lineTo(chX, 14);
+  ctx.stroke();
+  ctx.lineWidth = LW;
+
+  // drain lead: channel → elbow → terminal
+  ctx.strokeStyle = cd;
+  ctx.beginPath();
+  ctx.moveTo(chX, sd * 10);
+  ctx.lineTo(L, sd * 10);
+  ctx.lineTo(L, sd * H);
+  ctx.stroke();
+  // source lead
+  ctx.strokeStyle = cs;
+  ctx.beginPath();
+  ctx.moveTo(chX, -sd * 10);
+  ctx.lineTo(L, -sd * 10);
+  ctx.lineTo(L, -sd * H);
+  ctx.stroke();
+  // source arrow: NMOS points away from the channel, PMOS toward it
+  ctx.fillStyle = cs;
+  arrowHead(ctx, pmos ? chX + 4 : (chX + L) / 2 + 3, -sd * 10, pmos ? Math.PI : 0, 5.5);
+
+  ctx.restore();
+}
+
 export function componentLabel(c) {
   const d = DEFS[c.type];
-  if (c.value === undefined || !d.unit) return null;
+  if (c.value === undefined || !d.unit || isMos(c.type)) return null;
   let s = formatValue(c.value, d.unit);
   if (c.type === 'acsource') s += ' ' + formatValue(c.freq, 'Hz');
   return s;
@@ -322,6 +415,42 @@ export function componentLabel(c) {
 export function renderComponent(ctx, c, vScale, selected) {
   const x1 = c.x1 * CELL, y1 = c.y1 * CELL;
   const x2 = c.x2 * CELL, y2 = c.y2 * CELL;
+
+  if (isMos(c.type)) {
+    const x3 = c.x3 * CELL, y3 = c.y3 * CELL;
+    const mx = (x2 + x3) / 2, my = (y2 + y3) / 2;
+    if (selected) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(87,157,255,0.30)';
+      ctx.lineWidth = 12;
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(x1, y1); ctx.lineTo(mx, my);
+      ctx.moveTo(x2, y2); ctx.lineTo(mx, my);
+      ctx.moveTo(x3, y3); ctx.lineTo(mx, my);
+      ctx.stroke();
+      ctx.restore();
+    }
+    drawMosfet(ctx, c.type, x1, y1, x2, y2, x3, y3, {
+      cg: voltageColor(c._v1, vScale),
+      cd: voltageColor(c._v2, vScale),
+      cs: voltageColor(c._v3, vScale),
+    });
+    if (selected) {
+      ctx.save();
+      ctx.font = 'bold 10px system-ui, sans-serif';
+      ctx.fillStyle = '#8b95a9';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const cx = (x1 + x2 + x3) / 3, cy = (y1 + y2 + y3) / 3;
+      for (const [px, py, letter] of [[x1, y1, 'G'], [x2, y2, 'D'], [x3, y3, 'S']]) {
+        const dl = Math.hypot(px - cx, py - cy) || 1;
+        ctx.fillText(letter, px + (px - cx) / dl * 9, py + (py - cy) / dl * 9);
+      }
+      ctx.restore();
+    }
+    return;
+  }
 
   if (selected) {
     ctx.save();
