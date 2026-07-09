@@ -10,31 +10,57 @@ export const DEFS = {
   capacitor: { name: 'Capacitor', value: 10e-6, unit: 'F', valueLabel: 'Capacitance' },
   inductor: { name: 'Inductor', value: 0.1, unit: 'H', valueLabel: 'Inductance' },
   vsource: { name: 'Voltage Source (DC)', value: 5, unit: 'V', valueLabel: 'Voltage' },
-  acsource: { name: 'Voltage Source (AC)', value: 5, unit: 'V', valueLabel: 'Amplitude', freq: 60, offset: 0 },
+  acsource: { name: 'Voltage Source (AC)', value: 5, unit: 'V', valueLabel: 'Amplitude', freq: 60, offset: 0, wave: 'sine' },
   isource: { name: 'Current Source', value: 0.01, unit: 'A', valueLabel: 'Current' },
   ground: { name: 'Ground' },
   switch: { name: 'Switch', closed: false },
   diode: { name: 'Diode' },
+  zener: { name: 'Zener Diode', value: 5.1, unit: 'V', valueLabel: 'Breakdown' },
+  schottky: { name: 'Schottky Diode' },
   led: { name: 'LED' },
   nmos: { name: 'NMOS Transistor', value: 1.5, unit: 'V', valueLabel: 'Threshold' },
   pmos: { name: 'PMOS Transistor', value: 1.5, unit: 'V', valueLabel: 'Threshold' },
+  npn: { name: 'NPN Transistor' },
+  pnp: { name: 'PNP Transistor' },
+  opamp: { name: 'Op-Amp (±15 V rails)' },
+  potentiometer: { name: 'Potentiometer', value: 10000, unit: 'Ω', valueLabel: 'Resistance', pos: 0.5 },
 };
 
 export function isMos(type) {
   return type === 'nmos' || type === 'pmos';
 }
 
-// Rigid 3-terminal footprint: gate at (gx,gy), drain/source 3 cells along the
-// axis and ±2 cells perpendicular. dir is the axis direction: e/s/w/n.
-export function mosfetFootprint(gx, gy, dir = 'e') {
+export function is3Term(type) {
+  return isMos(type) || type === 'npn' || type === 'pnp' ||
+    type === 'opamp' || type === 'potentiometer';
+}
+
+// Terminal roles for the inspector / selected-part labels.
+export const TERMINAL_LETTERS = {
+  nmos: ['G', 'D', 'S'], pmos: ['G', 'D', 'S'],
+  npn: ['B', 'C', 'E'], pnp: ['B', 'C', 'E'],
+  opamp: ['+', '−', 'OUT'],
+  potentiometer: ['1', '2', 'W'],
+};
+
+// Rigid 3-terminal footprints anchored at terminal 1 (x1,y1), in grid units.
+// dir rotates the whole footprint: e/s/w/n.
+export function footprint3(type, gx, gy, dir = 'e') {
   const rot = {
     e: (x, y) => [x, y],
     s: (x, y) => [-y, x],
     w: (x, y) => [-x, -y],
     n: (x, y) => [y, -x],
   }[dir] || ((x, y) => [x, y]);
-  const [dx, dy] = rot(3, -2);
-  const [sx, sy] = rot(3, 2);
+  // [terminal2, terminal3] offsets from the anchor:
+  //   MOSFET/BJT: control pin left, D/C up-right, S/E down-right
+  //   op-amp: in+ anchor, in− two cells below, out 4 right / 1 down
+  //   potentiometer: ends span 4 cells, wiper 2 cells below the middle
+  const offs = type === 'opamp' ? [[0, 2], [4, 1]]
+    : type === 'potentiometer' ? [[4, 0], [2, 2]]
+    : [[3, -2], [3, 2]];
+  const [dx, dy] = rot(offs[0][0], offs[0][1]);
+  const [sx, sy] = rot(offs[1][0], offs[1][1]);
   return { x2: gx + dx, y2: gy + dy, x3: gx + sx, y3: gy + sy };
 }
 
@@ -42,15 +68,21 @@ export const PALETTE = [
   { type: 'select', name: 'Select / Move' },
   { type: 'wire', name: 'Wire' },
   { type: 'resistor', name: 'Resistor' },
+  { type: 'potentiometer', name: 'Potentiometer' },
   { type: 'capacitor', name: 'Capacitor' },
   { type: 'inductor', name: 'Inductor' },
   { type: 'vsource', name: 'DC Source' },
-  { type: 'acsource', name: 'AC Source' },
+  { type: 'acsource', name: 'AC / Func Gen' },
   { type: 'isource', name: 'Current Src' },
+  { type: 'diode', name: 'Diode' },
+  { type: 'zener', name: 'Zener' },
+  { type: 'schottky', name: 'Schottky' },
+  { type: 'led', name: 'LED' },
   { type: 'nmos', name: 'NMOS' },
   { type: 'pmos', name: 'PMOS' },
-  { type: 'diode', name: 'Diode' },
-  { type: 'led', name: 'LED' },
+  { type: 'npn', name: 'NPN' },
+  { type: 'pnp', name: 'PNP' },
+  { type: 'opamp', name: 'Op-Amp' },
   { type: 'switch', name: 'Switch' },
   { type: 'ground', name: 'Ground' },
 ];
@@ -62,7 +94,9 @@ export function makeComponent(type, x1, y1, x2, y2) {
   if (d.freq !== undefined) c.freq = d.freq;
   if (d.closed !== undefined) c.closed = d.closed;
   if (d.offset !== undefined) c.offset = d.offset;
-  if (isMos(type)) Object.assign(c, mosfetFootprint(x1, y1, 'e'));
+  if (d.wave !== undefined) c.wave = d.wave;
+  if (d.pos !== undefined) c.pos = d.pos;
+  if (is3Term(type)) Object.assign(c, footprint3(type, x1, y1, 'e'));
   return c;
 }
 
@@ -154,7 +188,8 @@ export function drawShape(ctx, type, x1, y1, x2, y2, opts = {}) {
   const half = len / 2;
   const bodyHalf = {
     resistor: 14, capacitor: 4, inductor: 14, vsource: 4, acsource: 10,
-    isource: 10, diode: 8, led: 8, switch: 11, wire: 0, ground: 0,
+    isource: 10, diode: 8, zener: 8, schottky: 8, led: 8, switch: 11,
+    wire: 0, ground: 0,
   }[type] ?? 10;
   const bh = Math.min(bodyHalf, half);
 
@@ -276,6 +311,8 @@ export function drawShape(ctx, type, x1, y1, x2, y2, opts = {}) {
       break;
     }
     case 'diode':
+    case 'zener':
+    case 'schottky':
     case 'led': {
       if (type === 'led' && opts.brightness > 0.02) {
         const b = Math.min(1, opts.brightness);
@@ -301,6 +338,19 @@ export function drawShape(ctx, type, x1, y1, x2, y2, opts = {}) {
       ctx.moveTo(half + 8, -8);
       ctx.lineTo(half + 8, 8);
       ctx.stroke();
+      if (type === 'zener') {
+        // bent cathode bar tails
+        ctx.beginPath();
+        ctx.moveTo(half + 8, -8); ctx.lineTo(half + 4, -11);
+        ctx.moveTo(half + 8, 8); ctx.lineTo(half + 12, 11);
+        ctx.stroke();
+      } else if (type === 'schottky') {
+        // hooked cathode bar
+        ctx.beginPath();
+        ctx.moveTo(half + 8, -8); ctx.lineTo(half + 12, -8); ctx.lineTo(half + 12, -5);
+        ctx.moveTo(half + 8, 8); ctx.lineTo(half + 4, 8); ctx.lineTo(half + 4, 5);
+        ctx.stroke();
+      }
       if (type === 'led') {
         ctx.fillStyle = BODY;
         ctx.lineWidth = 1.5;
@@ -403,9 +453,147 @@ export function drawMosfet(ctx, type, gx, gy, dx, dy, sx, sy, opts = {}) {
   ctx.restore();
 }
 
+// BJT symbol: base bar + diagonal collector/emitter leads inside a circle.
+export function drawBJT(ctx, type, bx, by, cx, cy, ex, ey, opts = {}) {
+  const cb = opts.c1 || BODY, cc = opts.c2 || BODY, ce = opts.c3 || BODY;
+  const mx = (cx + ex) / 2, my = (cy + ey) / 2;
+  const L = Math.hypot(mx - bx, my - by) || 1;
+  const H = Math.hypot(cx - mx, cy - my) || 1;
+  const ang = Math.atan2(my - by, mx - bx);
+
+  ctx.save();
+  ctx.translate(bx, by);
+  ctx.rotate(ang);
+  ctx.lineWidth = LW;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  const ldy = -Math.sin(ang) * (cx - bx) + Math.cos(ang) * (cy - by);
+  const sd = ldy < 0 ? -1 : 1; // collector side
+  const barX = L - 11;
+
+  ctx.strokeStyle = 'rgba(223,229,240,0.5)';
+  ctx.beginPath();
+  ctx.arc(L - 5, 0, 14, 0, Math.PI * 2);
+  ctx.stroke();
+
+  ctx.strokeStyle = cb;
+  ctx.beginPath();
+  ctx.moveTo(0, 0);
+  ctx.lineTo(barX, 0);
+  ctx.stroke();
+  ctx.strokeStyle = BODY;
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(barX, -9);
+  ctx.lineTo(barX, 9);
+  ctx.stroke();
+  ctx.lineWidth = LW;
+
+  // collector: diagonal from the bar, then straight to the terminal
+  ctx.strokeStyle = cc;
+  ctx.beginPath();
+  ctx.moveTo(barX, sd * 4);
+  ctx.lineTo(L, sd * 13);
+  ctx.lineTo(L, sd * H);
+  ctx.stroke();
+  // emitter
+  ctx.strokeStyle = ce;
+  ctx.beginPath();
+  ctx.moveTo(barX, -sd * 4);
+  ctx.lineTo(L, -sd * 13);
+  ctx.lineTo(L, -sd * H);
+  ctx.stroke();
+  // emitter arrow: NPN points outward, PNP points at the base bar
+  const angOut = Math.atan2(-sd * 9, 11);
+  ctx.fillStyle = ce;
+  if (type === 'pnp') {
+    arrowHead(ctx, barX + 3, -sd * 6.5, angOut + Math.PI, 6);
+  } else {
+    arrowHead(ctx, L - 2, -sd * 11.5, angOut, 6);
+  }
+
+  ctx.restore();
+}
+
+// Ideal op-amp triangle. Terminals: in+ (p1), in− (p2), out (p3).
+export function drawOpamp(ctx, x1, y1, x2, y2, x3, y3, opts = {}) {
+  const c1 = opts.c1 || BODY, c2 = opts.c2 || BODY, c3 = opts.c3 || BODY;
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const L = Math.hypot(x3 - mx, y3 - my) || 1;
+  const ang = Math.atan2(y3 - my, x3 - mx);
+
+  ctx.save();
+  ctx.translate(mx, my);
+  ctx.rotate(ang);
+  ctx.lineWidth = LW;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  const ly1 = -Math.sin(ang) * (x1 - mx) + Math.cos(ang) * (y1 - my);
+  const s1 = ly1 < 0 ? -1 : 1; // local side of in+
+  const sep = Math.hypot(x1 - x2, y1 - y2) / 2 || 16;
+
+  ctx.strokeStyle = c1;
+  ctx.beginPath(); ctx.moveTo(-0.01, s1 * sep); ctx.lineTo(7, s1 * sep); ctx.stroke();
+  ctx.strokeStyle = c2;
+  ctx.beginPath(); ctx.moveTo(-0.01, -s1 * sep); ctx.lineTo(7, -s1 * sep); ctx.stroke();
+  ctx.strokeStyle = c3;
+  ctx.beginPath(); ctx.moveTo(L - 7, 0); ctx.lineTo(L, 0); ctx.stroke();
+
+  ctx.fillStyle = '#20242e';
+  ctx.strokeStyle = BODY;
+  ctx.beginPath();
+  ctx.moveTo(7, -22);
+  ctx.lineTo(7, 22);
+  ctx.lineTo(L - 7, 0);
+  ctx.closePath();
+  ctx.fill();
+  ctx.stroke();
+
+  // + / − input markers
+  ctx.strokeStyle = BODY;
+  ctx.lineWidth = 1.6;
+  ctx.beginPath();
+  ctx.moveTo(11, s1 * sep - 3); ctx.lineTo(11, s1 * sep + 3);
+  ctx.moveTo(8, s1 * sep); ctx.lineTo(14, s1 * sep);
+  ctx.moveTo(8, -s1 * sep); ctx.lineTo(14, -s1 * sep);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// Potentiometer: a resistor body with a wiper arrow on the third terminal.
+export function drawPot(ctx, x1, y1, x2, y2, x3, y3, opts = {}) {
+  drawShape(ctx, 'resistor', x1, y1, x2, y2, { c1: opts.c1, c2: opts.c2 });
+  const mx = (x1 + x2) / 2, my = (y1 + y2) / 2;
+  const dl = Math.hypot(mx - x3, my - y3) || 1;
+  const ux = (mx - x3) / dl, uy = (my - y3) / dl;
+  const tipX = mx - ux * 10, tipY = my - uy * 10;
+  ctx.save();
+  ctx.strokeStyle = opts.c3 || BODY;
+  ctx.fillStyle = opts.c3 || BODY;
+  ctx.lineWidth = LW;
+  ctx.lineCap = 'round';
+  ctx.beginPath();
+  ctx.moveTo(x3, y3);
+  ctx.lineTo(tipX, tipY);
+  ctx.stroke();
+  arrowHead(ctx, tipX, tipY, Math.atan2(uy, ux), 6);
+  ctx.restore();
+}
+
+// Dispatcher for all rigid 3-terminal symbols.
+export function drawThreeTerm(ctx, type, x1, y1, x2, y2, x3, y3, opts = {}) {
+  if (isMos(type)) drawMosfet(ctx, type, x1, y1, x2, y2, x3, y3, { cg: opts.c1, cd: opts.c2, cs: opts.c3 });
+  else if (type === 'npn' || type === 'pnp') drawBJT(ctx, type, x1, y1, x2, y2, x3, y3, opts);
+  else if (type === 'opamp') drawOpamp(ctx, x1, y1, x2, y2, x3, y3, opts);
+  else if (type === 'potentiometer') drawPot(ctx, x1, y1, x2, y2, x3, y3, opts);
+}
+
 export function componentLabel(c) {
   const d = DEFS[c.type];
-  if (c.value === undefined || !d.unit || isMos(c.type)) return null;
+  if (c.value === undefined || !d.unit || is3Term(c.type)) return null;
   let s = formatValue(c.value, d.unit);
   if (c.type === 'acsource') s += ' ' + formatValue(c.freq, 'Hz');
   return s;
@@ -416,37 +604,50 @@ export function renderComponent(ctx, c, vScale, selected) {
   const x1 = c.x1 * CELL, y1 = c.y1 * CELL;
   const x2 = c.x2 * CELL, y2 = c.y2 * CELL;
 
-  if (isMos(c.type)) {
+  if (is3Term(c.type)) {
     const x3 = c.x3 * CELL, y3 = c.y3 * CELL;
-    const mx = (x2 + x3) / 2, my = (y2 + y3) / 2;
+    const cx = (x1 + x2 + x3) / 3, cy = (y1 + y2 + y3) / 3;
     if (selected) {
       ctx.save();
       ctx.strokeStyle = 'rgba(87,157,255,0.30)';
       ctx.lineWidth = 12;
       ctx.lineCap = 'round';
       ctx.beginPath();
-      ctx.moveTo(x1, y1); ctx.lineTo(mx, my);
-      ctx.moveTo(x2, y2); ctx.lineTo(mx, my);
-      ctx.moveTo(x3, y3); ctx.lineTo(mx, my);
+      ctx.moveTo(x1, y1); ctx.lineTo(cx, cy);
+      ctx.moveTo(x2, y2); ctx.lineTo(cx, cy);
+      ctx.moveTo(x3, y3); ctx.lineTo(cx, cy);
       ctx.stroke();
       ctx.restore();
     }
-    drawMosfet(ctx, c.type, x1, y1, x2, y2, x3, y3, {
-      cg: voltageColor(c._v1, vScale),
-      cd: voltageColor(c._v2, vScale),
-      cs: voltageColor(c._v3, vScale),
+    drawThreeTerm(ctx, c.type, x1, y1, x2, y2, x3, y3, {
+      c1: voltageColor(c._v1, vScale),
+      c2: voltageColor(c._v2, vScale),
+      c3: voltageColor(c._v3, vScale),
     });
+    if (c.type === 'potentiometer') {
+      // value label opposite the wiper
+      ctx.save();
+      ctx.font = '11px system-ui, sans-serif';
+      ctx.fillStyle = '#aeb7c9';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      const bmx = (x1 + x2) / 2, bmy = (y1 + y2) / 2;
+      const dl = Math.hypot(x3 - bmx, y3 - bmy) || 1;
+      ctx.fillText(formatValue(c.value, 'Ω'),
+        bmx - (x3 - bmx) / dl * 17, bmy - (y3 - bmy) / dl * 17);
+      ctx.restore();
+    }
     if (selected) {
       ctx.save();
       ctx.font = 'bold 10px system-ui, sans-serif';
       ctx.fillStyle = '#8b95a9';
       ctx.textAlign = 'center';
       ctx.textBaseline = 'middle';
-      const cx = (x1 + x2 + x3) / 3, cy = (y1 + y2 + y3) / 3;
-      for (const [px, py, letter] of [[x1, y1, 'G'], [x2, y2, 'D'], [x3, y3, 'S']]) {
+      const letters = TERMINAL_LETTERS[c.type] || ['1', '2', '3'];
+      [[x1, y1], [x2, y2], [x3, y3]].forEach(([px, py], k) => {
         const dl = Math.hypot(px - cx, py - cy) || 1;
-        ctx.fillText(letter, px + (px - cx) / dl * 9, py + (py - cy) / dl * 9);
-      }
+        ctx.fillText(letters[k], px + (px - cx) / dl * 9, py + (py - cy) / dl * 9);
+      });
       ctx.restore();
     }
     return;

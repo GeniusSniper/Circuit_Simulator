@@ -2,7 +2,7 @@
 
 import { Simulation } from './engine.js';
 import {
-  CELL, DEFS, PALETTE, drawShape, drawMosfet, isMos,
+  CELL, DEFS, PALETTE, drawShape, drawThreeTerm, isMos, is3Term,
   formatValue, parseValue, componentLabel,
 } from './components.js';
 import { Editor } from './editor.js';
@@ -31,9 +31,9 @@ const editor = new Editor($('canvas'), {
     errorMsg = null;
     saveSoon();
   },
-  onSelect(c) {
+  onSelect(c, count) {
     scopeHist.length = 0;
-    buildInspector(c);
+    buildInspector(c, count);
   },
   onHover(c, g) {
     if (c) {
@@ -45,6 +45,15 @@ const editor = new Editor($('canvas'), {
           parts.push('Vgs: ' + formatValue((c._v1 - c._v3) || 0, 'V'));
           parts.push('Vds: ' + formatValue((c._v2 - c._v3) || 0, 'V'));
           parts.push('Id: ' + formatValue(c._i || 0, 'A'));
+        } else if (c.type === 'npn' || c.type === 'pnp') {
+          parts.push('Vbe: ' + formatValue((c._v1 - c._v3) || 0, 'V'));
+          parts.push('Vce: ' + formatValue((c._v2 - c._v3) || 0, 'V'));
+          parts.push('Ic: ' + formatValue(c._i || 0, 'A'));
+        } else if (c.type === 'opamp') {
+          parts.push('Vout: ' + formatValue(c._v3 || 0, 'V'));
+          parts.push('Iout: ' + formatValue(c._i || 0, 'A'));
+        } else if (c.type === 'potentiometer') {
+          parts.push('Wiper: ' + formatValue(c._v3 || 0, 'V'));
         } else {
           parts.push('V: ' + formatValue((c._v1 - c._v2) || 0, 'V'));
           parts.push('I: ' + formatValue(c._i || 0, 'A'));
@@ -66,7 +75,7 @@ const editor = new Editor($('canvas'), {
 
 function defaultHint() {
   if (editor.tool === 'select') {
-    return 'Select: click to pick, drag to move, drag endpoints to reshape. Click a switch to toggle it. R rotates, Del deletes.';
+    return 'Select: click to pick, drag empty space to box-select a group, Shift-click to add. Drag to move, R rotates, Del deletes. Click a switch to toggle it.';
   }
   return `Drag on the canvas to place a ${DEFS[editor.tool]?.name || editor.tool} (a plain click places one too). Esc returns to Select.`;
 }
@@ -106,8 +115,11 @@ function buildPalette() {
       ictx.fill();
     } else if (item.type === 'ground') {
       drawShape(ictx, 'ground', 22, 5, 22, 20, {});
-    } else if (isMos(item.type)) {
-      drawMosfet(ictx, item.type, 8, 13, 36, 3, 36, 23, {});
+    } else if (is3Term(item.type)) {
+      const pts = item.type === 'opamp' ? [4, 6, 4, 20, 40, 13]
+        : item.type === 'potentiometer' ? [3, 9, 41, 9, 22, 22]
+        : [8, 13, 36, 3, 36, 23];
+      drawThreeTerm(ictx, item.type, ...pts, {});
     } else {
       drawShape(ictx, item.type, 3, 13, 41, 13, { closed: false });
     }
@@ -115,7 +127,11 @@ function buildPalette() {
     const label = document.createElement('span');
     label.textContent = item.name;
     btn.append(icon, label);
-    btn.addEventListener('click', () => setTool(item.type));
+    if (item.type === 'select') {
+      btn.addEventListener('click', () => setTool('select'));
+    } else {
+      wirePaletteDrag(btn, item.type);
+    }
     pal.appendChild(btn);
   }
 }
@@ -127,13 +143,64 @@ function setTool(type) {
   setHint(defaultHint());
 }
 
+// A palette button works two ways: a plain click arms the placement tool
+// (sticky, like before), while pressing and dragging pulls a live part
+// straight out of the palette and drops it on the canvas.
+function wirePaletteDrag(btn, type) {
+  let pd = null;
+  btn.addEventListener('pointerdown', e => {
+    if (e.button !== 0) return;
+    pd = { x: e.clientX, y: e.clientY, id: e.pointerId, dragging: false };
+  });
+  btn.addEventListener('pointermove', e => {
+    if (!pd) return;
+    if (!pd.dragging && Math.hypot(e.clientX - pd.x, e.clientY - pd.y) > 5) {
+      pd.dragging = true;
+      try { btn.setPointerCapture(pd.id); } catch { /* synthetic events */ }
+      editor.beginPaletteDrag(type);
+    }
+    if (pd.dragging) editor.movePaletteDrag(e.clientX, e.clientY);
+  });
+  btn.addEventListener('pointerup', e => {
+    if (!pd) return;
+    if (pd.dragging) {
+      if (editor.dropPaletteDrag(e.clientX, e.clientY)) setTool('select');
+      else editor.cancelPaletteDrag();
+    } else {
+      setTool(type); // plain click
+    }
+    pd = null;
+  });
+  btn.addEventListener('pointercancel', () => {
+    editor.cancelPaletteDrag();
+    pd = null;
+  });
+}
+
 // ---------- inspector ----------
 
-function buildInspector(c) {
+function buildInspector(c, count = 0) {
   const box = $('inspector-body');
   box.innerHTML = '';
   if (!c) {
-    box.innerHTML = '<p class="muted">Nothing selected.<br>Click a component to inspect and edit it, or pick a part from the palette and drag it onto the canvas.</p>';
+    if (count > 1) {
+      box.innerHTML = `<h3>${count} components selected</h3>` +
+        '<p class="muted">Drag any selected part to move the whole group. <b>R</b> rotates the group, <b>Del</b> deletes it, Shift-click adds or removes parts.</p>';
+      const row = document.createElement('div');
+      row.className = 'btn-row';
+      const rot = document.createElement('button');
+      rot.className = 'btn';
+      rot.textContent = 'Rotate (R)';
+      rot.addEventListener('click', () => editor.rotateSelection());
+      const del = document.createElement('button');
+      del.className = 'btn danger';
+      del.textContent = 'Delete (Del)';
+      del.addEventListener('click', () => editor.deleteSelection());
+      row.append(rot, del);
+      box.appendChild(row);
+      return;
+    }
+    box.innerHTML = '<p class="muted">Nothing selected.<br>Click a component to inspect and edit it, drag across the canvas to select a group, or pick a part from the palette and drag it onto the canvas.</p>';
     return;
   }
   const d = DEFS[c.type];
@@ -175,6 +242,49 @@ function buildInspector(c) {
   }
   if (c.offset !== undefined) {
     addField('DC Offset (V)', () => formatValue(c.offset, ''), v => { c.offset = v; });
+  }
+  if (c.wave !== undefined) {
+    const row = document.createElement('label');
+    row.className = 'field';
+    const span = document.createElement('span');
+    span.textContent = 'Waveform';
+    const sel = document.createElement('select');
+    for (const w of ['sine', 'square', 'triangle', 'sawtooth']) {
+      const opt = document.createElement('option');
+      opt.value = w;
+      opt.textContent = w[0].toUpperCase() + w.slice(1);
+      sel.appendChild(opt);
+    }
+    sel.value = c.wave || 'sine';
+    sel.addEventListener('change', () => {
+      editor.pushUndo();
+      c.wave = sel.value;
+      dirty = true;
+      saveSoon();
+    });
+    row.append(span, sel);
+    box.appendChild(row);
+  }
+  if (c.pos !== undefined) {
+    const row = document.createElement('label');
+    row.className = 'field';
+    const span = document.createElement('span');
+    const sync = () => { span.textContent = `Wiper position — ${Math.round(c.pos * 100)}%`; };
+    sync();
+    const slider = document.createElement('input');
+    slider.type = 'range';
+    slider.min = '1'; slider.max = '99';
+    slider.value = String(Math.round(c.pos * 100));
+    let armed = false;
+    slider.addEventListener('input', () => {
+      if (!armed) { editor.pushUndo(); armed = true; }
+      c.pos = slider.valueAsNumber / 100;
+      sync();
+      dirty = true;
+    });
+    slider.addEventListener('change', () => { armed = false; saveSoon(); });
+    row.append(span, slider);
+    box.appendChild(row);
   }
   if (c.closed !== undefined) {
     const btn = document.createElement('button');
@@ -223,15 +333,31 @@ function updateLiveReadout() {
   const el = $('live-readout');
   if (!c || !el) return;
   if (c._v1 === undefined) { el.textContent = ''; return; }
-  if (isMos(c.type)) {
-    const vgs = (c._v1 - c._v3) || 0;
-    const vds = (c._v2 - c._v3) || 0;
+  if (isMos(c.type) || c.type === 'npn' || c.type === 'pnp') {
+    const bjt = !isMos(c.type);
+    const vin = (c._v1 - c._v3) || 0;  // Vgs / Vbe
+    const vout = (c._v2 - c._v3) || 0; // Vds / Vce
     const id = c._i || 0;
     el.innerHTML =
-      `<div><span>V<sub>GS</sub></span><b>${formatValue(vgs, 'V')}</b></div>` +
-      `<div><span>V<sub>DS</sub></span><b>${formatValue(vds, 'V')}</b></div>` +
-      `<div><span>I<sub>D</sub></span><b>${formatValue(id, 'A')}</b></div>` +
-      `<div><span>Power</span><b>${formatValue(vds * id, 'W')}</b></div>`;
+      `<div><span>V<sub>${bjt ? 'BE' : 'GS'}</sub></span><b>${formatValue(vin, 'V')}</b></div>` +
+      `<div><span>V<sub>${bjt ? 'CE' : 'DS'}</sub></span><b>${formatValue(vout, 'V')}</b></div>` +
+      `<div><span>I<sub>${bjt ? 'C' : 'D'}</sub></span><b>${formatValue(id, 'A')}</b></div>` +
+      `<div><span>Power</span><b>${formatValue(vout * id, 'W')}</b></div>`;
+    return;
+  }
+  if (c.type === 'opamp') {
+    el.innerHTML =
+      `<div><span>V<sub>+</sub></span><b>${formatValue(c._v1 || 0, 'V')}</b></div>` +
+      `<div><span>V<sub>−</sub></span><b>${formatValue(c._v2 || 0, 'V')}</b></div>` +
+      `<div><span>V<sub>out</sub></span><b>${formatValue(c._v3 || 0, 'V')}</b></div>` +
+      `<div><span>I<sub>out</sub></span><b>${formatValue(c._i || 0, 'A')}</b></div>`;
+    return;
+  }
+  if (c.type === 'potentiometer') {
+    el.innerHTML =
+      `<div><span>End 1</span><b>${formatValue(c._v1 || 0, 'V')}</b></div>` +
+      `<div><span>End 2</span><b>${formatValue(c._v2 || 0, 'V')}</b></div>` +
+      `<div><span>Wiper</span><b>${formatValue(c._v3 || 0, 'V')}</b></div>`;
     return;
   }
   const v = (c._v1 - c._v2) || 0;
@@ -245,7 +371,10 @@ function updateLiveReadout() {
 function sampleScope() {
   const c = editor.selection;
   if (!c || c._v1 === undefined) return;
-  const v = isMos(c.type) ? (c._v2 - c._v3) : (c._v1 - c._v2); // MOSFET scope traces Vds
+  // scope trace: Vds/Vce for transistors, Vout for op-amps, wiper for pots
+  const v = (isMos(c.type) || c.type === 'npn' || c.type === 'pnp') ? (c._v2 - c._v3)
+    : (c.type === 'opamp' || c.type === 'potentiometer') ? c._v3
+    : (c._v1 - c._v2);
   scopeHist.push({ v: v || 0, i: c._i || 0 });
   if (scopeHist.length > SCOPE_MAX) scopeHist.splice(0, scopeHist.length - SCOPE_MAX);
 }
@@ -310,7 +439,8 @@ function resetStates() {
   for (const c of editor.components) {
     if (c.type === 'capacitor' || c.type === 'inductor') c.state = 0;
     delete c._vd;
-    delete c._lvg; delete c._lvd; delete c._lvs;
+    delete c._it;
+    delete c._jbe; delete c._jbc;
     delete c._v1;
     delete c._v2;
     delete c._v3;
@@ -416,7 +546,11 @@ document.addEventListener('keydown', e => {
   if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
   if (e.key === 'Delete' || e.key === 'Backspace') { editor.deleteSelection(); e.preventDefault(); }
   else if (e.key === 'r' || e.key === 'R') editor.rotateSelection();
-  else if (e.key === 'Escape') setTool('select');
+  else if ((e.ctrlKey || e.metaKey) && e.key === 'a') { editor.selectAll(); e.preventDefault(); }
+  else if (e.key === 'Escape') {
+    if (editor.tool !== 'select') setTool('select');
+    else editor.select(null);
+  }
   else if (e.key === ' ') { toggleRun(); e.preventDefault(); }
   else if ((e.ctrlKey || e.metaKey) && e.key === 'z') { editor.undo(); e.preventDefault(); }
   else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.shiftKey && e.key === 'Z'))) { editor.redo(); e.preventDefault(); }

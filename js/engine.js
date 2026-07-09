@@ -5,14 +5,25 @@
 // sources (grounds are 0 V sources to the global reference node), which gives
 // us an exact branch current for every one of them — used for the current
 // animation. Capacitors and inductors use backward-Euler companion models.
-// Diodes/LEDs are solved with damped Newton-Raphson iteration.
+// Nonlinear devices (diodes, MOSFETs, BJTs, op-amps) are solved with damped
+// Newton-Raphson iteration.
 
 const GMIN = 1e-9;        // leak from every node to ground; keeps the matrix nonsingular
 const VT = 0.025852;      // thermal voltage at room temperature
 
-const DIODE_PARAMS = { is: 1e-9, n: 1.5 };   // Vf ~ 0.65 V at 10 mA
-const LED_PARAMS = { is: 1e-18, n: 2.0 };    // Vf ~ 1.9 V at 10 mA
-const MOS_K = 0.02;                          // transconductance parameter (A/V²)
+const DIODE_PARAMS = {
+  diode: { is: 1e-9, n: 1.5 },      // Vf ~ 0.65 V at 10 mA
+  zener: { is: 1e-9, n: 1.5 },      // forward: like a normal diode
+  schottky: { is: 1e-6, n: 1.2 },   // Vf ~ 0.3 V at 10 mA
+  led: { is: 1e-18, n: 2.0 },       // Vf ~ 1.9 V at 10 mA
+};
+const ZENER_IS = 5e-6;               // reverse-breakdown knee current scale
+
+const MOS_K = 0.02;                  // MOSFET transconductance parameter (A/V²)
+const BJT_BF = 100, BJT_BR = 1, BJT_IS = 1e-14;
+const OPAMP_GAIN = 1e5, OPAMP_RAIL = 15;
+
+export const DIODE_TYPES = new Set(['diode', 'zener', 'schottky', 'led']);
 
 export function isVoltageLike(c) {
   return c.type === 'vsource' || c.type === 'acsource' || c.type === 'ground' ||
@@ -21,6 +32,32 @@ export function isVoltageLike(c) {
 
 export function isMosfet(c) {
   return c.type === 'nmos' || c.type === 'pmos';
+}
+
+export function isBJT(c) {
+  return c.type === 'npn' || c.type === 'pnp';
+}
+
+// Components with a third terminal at (x3, y3).
+export function isThreeTerminal(c) {
+  return isMosfet(c) || isBJT(c) || c.type === 'opamp' || c.type === 'potentiometer';
+}
+
+// Diode current and small-signal conductance at voltage v (anode − cathode).
+// Zeners add an exponential reverse-breakdown term at v ≈ −Vz.
+export function diodeIV(c, v) {
+  const p = DIODE_PARAMS[c.type];
+  const nvt = p.n * VT;
+  const e = Math.exp(Math.min(v / nvt, 60));
+  let i = p.is * (e - 1);
+  let g = p.is * e / nvt + 1e-12;
+  if (c.type === 'zener') {
+    const vz = Math.abs(c.value) || 5.1;
+    const ez = Math.exp(Math.min((-v - vz) / VT, 60));
+    i -= ZENER_IS * ez;
+    g += ZENER_IS * ez / VT;
+  }
+  return { i, g };
 }
 
 // Square-law MOSFET operating point. Terminals: _a = gate, _b = drain, _c = source.
@@ -54,6 +91,41 @@ export function mosOP(c, Vg, Vd, Vs) {
     gds = 1e-8;
   }
   return { d, s, reversed, idEff: pol * id, gm, gds, Vd, Vs };
+}
+
+// Ebers-Moll BJT evaluated at junction voltages vbe/vbc (polarity frame:
+// PNP is an NPN with all voltages/currents negated). Terminals:
+// _a = base, _b = collector, _c = emitter. Everything the Newton stamp needs
+// depends only on the two junction voltages.
+export function bjtJunction(vbe, vbc) {
+  const ebe = Math.exp(Math.min(vbe / VT, 60));
+  const ebc = Math.exp(Math.min(vbc / VT, 60));
+  const ge = BJT_IS / VT * ebe + 1e-12;
+  const gc = BJT_IS / VT * ebc + 1e-12;
+  const ic = BJT_IS * ((ebe - ebc) - (ebc - 1) / BJT_BR);
+  const ib = BJT_IS * ((ebe - 1) / BJT_BF + (ebc - 1) / BJT_BR);
+  return { ib, ic, ge, gc };
+}
+
+// Terminal currents in the actual frame (for readouts).
+export function bjtOP(c, Vb, Vc, Ve) {
+  const pol = c.type === 'pnp' ? -1 : 1;
+  const { ib, ic } = bjtJunction(pol * (Vb - Ve), pol * (Vb - Vc));
+  return { ib: pol * ib, ic: pol * ic };
+}
+
+// SPICE-style pn-junction Newton limiting: prevents the exponential from
+// overshooting and oscillating between iterations.
+const BJT_VCRIT = VT * Math.log(VT / (Math.SQRT2 * BJT_IS));
+function pnjlim(vnew, vold) {
+  if (vnew > BJT_VCRIT && Math.abs(vnew - vold) > 2 * VT) {
+    if (vold > 0) {
+      const arg = 1 + (vnew - vold) / VT;
+      return arg > 0 ? vold + VT * Math.log(arg) : BJT_VCRIT;
+    }
+    return VT * Math.log(vnew / VT);
+  }
+  return vnew;
 }
 
 export function luFactor(A) {
@@ -125,19 +197,26 @@ export class Simulation {
     this.vsrcs = [];
     this.diodes = [];
     this.mosfets = [];
+    this.bjts = [];
+    this.opamps = [];
     for (const c of comps) {
       c._a = nodeOf(c.x1, c.y1);
       c._b = c.type === 'ground' ? 0 : nodeOf(c.x2, c.y2);
-      c._c = isMosfet(c) ? nodeOf(c.x3, c.y3) : -1;
+      c._c = isThreeTerminal(c) ? nodeOf(c.x3, c.y3) : -1;
       c._vs = -1;
-      if (isVoltageLike(c)) { c._vs = this.vsrcs.length; this.vsrcs.push(c); }
-      if (c.type === 'diode' || c.type === 'led') {
+      if (isVoltageLike(c) || c.type === 'opamp') { c._vs = this.vsrcs.length; this.vsrcs.push(c); }
+      if (DIODE_TYPES.has(c.type)) {
         this.diodes.push(c);
         if (typeof c._vd !== 'number') c._vd = 0.6;
       }
-      if (isMosfet(c)) {
-        this.mosfets.push(c);
-        if (typeof c._lvg !== 'number') { c._lvg = 0; c._lvd = 0; c._lvs = 0; }
+      if (isMosfet(c)) this.mosfets.push(c);
+      if (isBJT(c)) {
+        this.bjts.push(c);
+        if (typeof c._jbe !== 'number') { c._jbe = 0; c._jbc = 0; } // junction-voltage iterates
+      }
+      if (c.type === 'opamp') this.opamps.push(c);
+      if ((isMosfet(c) || c.type === 'opamp') && !Array.isArray(c._it)) {
+        c._it = [0, 0, 0]; // damped Newton iterate of the three terminal voltages
       }
       if (c.type === 'capacitor' && typeof c.state !== 'number') c.state = 0; // voltage across
       if (c.type === 'inductor' && typeof c.state !== 'number') c.state = 0; // current through
@@ -146,7 +225,8 @@ export class Simulation {
     this.n = Math.max(0, next - 1); // non-reference node count
     this.m = this.vsrcs.length;
     this.size = this.n + this.m;
-    this.nonlinear = this.diodes.length > 0 || this.mosfets.length > 0;
+    this.nonlinear = this.diodes.length > 0 || this.mosfets.length > 0 ||
+      this.bjts.length > 0 || this.opamps.length > 0;
     this.x = new Float64Array(this.size);
 
     this.buildBase();
@@ -174,18 +254,43 @@ export class Simulation {
         case 'resistor': stG(a, b, 1 / Math.max(c.value, 1e-9)); break;
         case 'capacitor': stG(a, b, c.value / this.dt); break;
         case 'inductor': stG(a, b, this.dt / Math.max(c.value, 1e-12)); break;
+        case 'potentiometer': {
+          const R = Math.max(c.value, 1e-6);
+          const pos = Math.min(0.999, Math.max(0.001, c.pos ?? 0.5));
+          stG(a, c._c, 1 / (R * pos));       // end 1 → wiper
+          stG(c._c, b, 1 / (R * (1 - pos))); // wiper → end 2
+          break;
+        }
       }
       if (c._vs >= 0) {
         const r = this.n + c._vs;
-        if (a > 0) { A[r][a - 1] += 1; A[a - 1][r] += 1; }
-        if (b > 0) { A[r][b - 1] -= 1; A[b - 1][r] -= 1; }
+        if (c.type === 'opamp') {
+          // Only the output branch-current column; the constraint row is
+          // stamped per Newton iteration (linear region vs. rail clamp).
+          if (c._c > 0) { A[c._c - 1][r] += 1; }
+        } else {
+          // constraint row: va − vb = V ; branch current col
+          if (a > 0) { A[r][a - 1] += 1; A[a - 1][r] += 1; }
+          if (b > 0) { A[r][b - 1] -= 1; A[b - 1][r] -= 1; }
+        }
       }
     }
   }
 
   sourceVoltage(c, t) {
     if (c.type === 'vsource') return c.value;
-    if (c.type === 'acsource') return (c.offset || 0) + c.value * Math.sin(2 * Math.PI * (c.freq || 60) * t);
+    if (c.type === 'acsource') {
+      const off = c.offset || 0;
+      const f = c.freq || 60;
+      const ph = ((t * f) % 1 + 1) % 1;
+      switch (c.wave) {
+        case 'square': return off + (ph < 0.5 ? c.value : -c.value);
+        case 'triangle':
+          return off + c.value * (ph < 0.25 ? 4 * ph : ph < 0.75 ? 2 - 4 * ph : 4 * ph - 4);
+        case 'sawtooth': return off + c.value * (2 * ph - 1);
+        default: return off + c.value * Math.sin(2 * Math.PI * f * t);
+      }
+    }
     return 0; // ground, wire, closed switch
   }
 
@@ -205,24 +310,15 @@ export class Simulation {
         add(a, -c.value);
         add(b, c.value);
       }
-      if (c._vs >= 0) z[this.n + c._vs] = this.sourceVoltage(c, t);
+      if (c._vs >= 0 && c.type !== 'opamp') z[this.n + c._vs] = this.sourceVoltage(c, t);
     }
     return z;
-  }
-
-  diodeParams(c) {
-    return c.type === 'led' ? LED_PARAMS : DIODE_PARAMS;
   }
 
   step(t) {
     if (this.size === 0) return;
     const z = this.buildRHS(t);
-    let x;
-    if (!this.nonlinear) {
-      x = luSolve(this.lu, this.piv, z);
-    } else {
-      x = this.newton(z);
-    }
+    const x = this.nonlinear ? this.newton(z) : luSolve(this.lu, this.piv, z);
     this.x = x;
     this.readResults();
   }
@@ -237,11 +333,7 @@ export class Simulation {
       const inj = (i, v) => { if (i > 0) zz[i - 1] += v; };
 
       for (const c of this.diodes) {
-        const { is, n } = this.diodeParams(c);
-        const nvt = n * VT;
-        const e = Math.exp(Math.min(c._vd / nvt, 60));
-        const gd = is * e / nvt + 1e-12;
-        const id = is * (e - 1);
+        const { i: id, g: gd } = diodeIV(c, c._vd);
         const ieq = id - gd * c._vd;
         st(c._a, c._a, gd); st(c._b, c._b, gd);
         st(c._a, c._b, -gd); st(c._b, c._a, -gd);
@@ -251,12 +343,49 @@ export class Simulation {
 
       for (const c of this.mosfets) {
         const g = c._a;
-        const { d, s, idEff, gm, gds, Vd, Vs } = mosOP(c, c._lvg, c._lvd, c._lvs);
-        const ieq = idEff - (gm * c._lvg + gds * Vd - (gm + gds) * Vs);
+        const { d, s, idEff, gm, gds, Vd, Vs } = mosOP(c, c._it[0], c._it[1], c._it[2]);
+        const ieq = idEff - (gm * c._it[0] + gds * Vd - (gm + gds) * Vs);
         st(d, g, gm); st(d, d, gds); st(d, s, -(gm + gds));
         st(s, g, -gm); st(s, d, -gds); st(s, s, gm + gds);
         inj(d, -ieq);
         inj(s, ieq);
+      }
+
+      for (const c of this.bjts) {
+        const pol = c.type === 'pnp' ? -1 : 1;
+        const bn = c._a, cn = c._b, en = c._c;
+        const { ib, ic, ge, gc } = bjtJunction(c._jbe, c._jbc);
+        // conductance-matrix rows (identical for NPN/PNP; pol² = 1)
+        const dIb = { b: ge / BJT_BF + gc / BJT_BR, c: -gc / BJT_BR, e: -ge / BJT_BF };
+        const dIc = { b: ge - gc * (1 + 1 / BJT_BR), c: gc * (1 + 1 / BJT_BR), e: -ge };
+        const ieqB = pol * (ib - (ge / BJT_BF * c._jbe + gc / BJT_BR * c._jbc));
+        const ieqC = pol * (ic - (ge * c._jbe - gc * (1 + 1 / BJT_BR) * c._jbc));
+        st(bn, bn, dIb.b); st(bn, cn, dIb.c); st(bn, en, dIb.e);
+        st(cn, bn, dIc.b); st(cn, cn, dIc.c); st(cn, en, dIc.e);
+        // emitter row is minus the sum (Ie leaving = −(Ib + Ic))
+        st(en, bn, -(dIb.b + dIc.b)); st(en, cn, -(dIb.c + dIc.c)); st(en, en, -(dIb.e + dIc.e));
+        inj(bn, -ieqB);
+        inj(cn, -ieqC);
+        inj(en, ieqB + ieqC);
+      }
+
+      for (const c of this.opamps) {
+        const r = this.n + c._vs;
+        const pred = OPAMP_GAIN * (c._it[0] - c._it[1]);
+        const row = A[r];
+        if (pred > OPAMP_RAIL) {
+          if (c._c > 0) row[c._c - 1] += 1;
+          zz[r] = OPAMP_RAIL;
+        } else if (pred < -OPAMP_RAIL) {
+          if (c._c > 0) row[c._c - 1] += 1;
+          zz[r] = -OPAMP_RAIL;
+        } else {
+          // Vout/G − (v+ − v−) = 0, scaled by 1/G for conditioning
+          if (c._c > 0) row[c._c - 1] += 1 / OPAMP_GAIN;
+          if (c._a > 0) row[c._a - 1] -= 1;
+          if (c._b > 0) row[c._b - 1] += 1;
+          zz[r] = 0;
+        }
       }
 
       const piv = luFactor(A);
@@ -269,11 +398,29 @@ export class Simulation {
         c._vd += clamp(dv, 0.6); // damping keeps exp() from blowing up
       }
       for (const c of this.mosfets) {
-        const dg = V(c._a) - c._lvg, dd = V(c._b) - c._lvd, ds = V(c._c) - c._lvs;
-        maxDelta = Math.max(maxDelta, Math.abs(dg), Math.abs(dd), Math.abs(ds));
-        c._lvg += clamp(dg, 1);
-        c._lvd += clamp(dd, 1);
-        c._lvs += clamp(ds, 1);
+        const lim = 1;
+        for (let k = 0; k < 3; k++) {
+          const nv = V([c._a, c._b, c._c][k]);
+          const dv = nv - c._it[k];
+          maxDelta = Math.max(maxDelta, Math.abs(dv));
+          c._it[k] += clamp(dv, lim);
+        }
+      }
+      for (const c of this.bjts) {
+        const pol = c.type === 'pnp' ? -1 : 1;
+        const jbe = pnjlim(pol * (V(c._a) - V(c._c)), c._jbe);
+        const jbc = pnjlim(pol * (V(c._a) - V(c._b)), c._jbc);
+        maxDelta = Math.max(maxDelta, Math.abs(jbe - c._jbe), Math.abs(jbc - c._jbc));
+        c._jbe = jbe;
+        c._jbc = jbc;
+      }
+      for (const c of this.opamps) {
+        for (let k = 0; k < 3; k++) {
+          const nv = V([c._a, c._b, c._c][k]);
+          const dv = nv - c._it[k];
+          maxDelta = Math.max(maxDelta, Math.abs(dv));
+          c._it[k] += clamp(dv, 30);
+        }
       }
       if (maxDelta < 1e-6) break;
     }
@@ -286,6 +433,7 @@ export class Simulation {
     for (const c of this.comps) {
       c._v1 = V(c._a);
       c._v2 = V(c._b);
+      if (c._c >= 0) c._v3 = V(c._c);
       const vd = c._v1 - c._v2;
       switch (c.type) {
         case 'resistor': c._i = vd / Math.max(c.value, 1e-9); break;
@@ -303,16 +451,28 @@ export class Simulation {
         }
         case 'isource': c._i = c.value; break;
         case 'diode':
-        case 'led': {
-          const { is, n } = this.diodeParams(c);
-          c._i = is * (Math.exp(Math.min(vd / (n * VT), 60)) - 1);
+        case 'zener':
+        case 'schottky':
+        case 'led':
+          c._i = diodeIV(c, vd).i;
           break;
-        }
         case 'nmos':
         case 'pmos': {
-          c._v3 = V(c._c);
           const op = mosOP(c, c._v1, c._v2, c._v3);
           c._i = op.reversed ? -op.idEff : op.idEff; // actual drain → source
+          break;
+        }
+        case 'npn':
+        case 'pnp':
+          c._i = bjtOP(c, c._v1, c._v2, c._v3).ic; // collector current
+          break;
+        case 'opamp':
+          c._i = -x[this.n + c._vs]; // current sourced from the output
+          break;
+        case 'potentiometer': {
+          const R = Math.max(c.value, 1e-6);
+          const pos = Math.min(0.999, Math.max(0.001, c.pos ?? 0.5));
+          c._i = (c._v1 - c._v3) / (R * pos); // end 1 → wiper
           break;
         }
         case 'switch':

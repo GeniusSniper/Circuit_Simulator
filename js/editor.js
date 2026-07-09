@@ -4,8 +4,8 @@
 // (including junction dots and drag-to-connect highlights).
 
 import {
-  CELL, DEFS, makeComponent, renderComponent, drawShape, drawMosfet,
-  voltageColor, isMos, mosfetFootprint,
+  CELL, DEFS, makeComponent, renderComponent, drawShape, drawThreeTerm,
+  voltageColor, is3Term, footprint3,
 } from './components.js';
 
 const HIT_DIST = 6;
@@ -40,11 +40,11 @@ function cardinalDir(x0, y0, gx, gy) {
 // Grid-space terminal points of a component, paired with their solved voltages.
 export function terminalsOf(c) {
   if (c.type === 'ground') return [[c.x1, c.y1, c._v1]];
-  if (isMos(c.type)) return [[c.x1, c.y1, c._v1], [c.x2, c.y2, c._v2], [c.x3, c.y3, c._v3]];
+  if (is3Term(c.type)) return [[c.x1, c.y1, c._v1], [c.x2, c.y2, c._v2], [c.x3, c.y3, c._v3]];
   return [[c.x1, c.y1, c._v1], [c.x2, c.y2, c._v2]];
 }
 
-const PERSISTED = ['value', 'freq', 'closed', 'offset', 'x3', 'y3'];
+const PERSISTED = ['value', 'freq', 'closed', 'offset', 'wave', 'pos', 'x3', 'y3'];
 
 function makeFromObj(o) {
   const c = makeComponent(o.type, o.x1, o.y1, o.x2, o.y2);
@@ -58,7 +58,7 @@ export class Editor {
     this.ctx = canvas.getContext('2d');
     this.components = [];
     this.tool = 'select';
-    this.selection = null;
+    this.selected = new Set(); // multi-selection; `selection` is the single-item view
     this.hover = null;
     this.drag = null;
     this.undoStack = [];
@@ -141,9 +141,30 @@ export class Editor {
     this.cb.onChange?.();
   }
 
+  // Single-item view of the selection (what the inspector edits).
+  get selection() {
+    return this.selected.size === 1 ? this.selected.values().next().value : null;
+  }
+
+  notifySelect() {
+    this.cb.onSelect?.(this.selection, this.selected.size);
+  }
+
   select(c) {
-    this.selection = c;
-    this.cb.onSelect?.(c);
+    this.selected.clear();
+    if (c) this.selected.add(c);
+    this.notifySelect();
+  }
+
+  selectMany(comps) {
+    this.selected = new Set(comps);
+    this.notifySelect();
+  }
+
+  toggleSelect(c) {
+    if (this.selected.has(c)) this.selected.delete(c);
+    else this.selected.add(c);
+    this.notifySelect();
   }
 
   setTool(t) {
@@ -154,19 +175,38 @@ export class Editor {
   }
 
   deleteSelection() {
-    if (!this.selection) return;
+    if (!this.selected.size) return;
     this.pushUndo();
-    this.components = this.components.filter(c => c !== this.selection);
+    this.components = this.components.filter(c => !this.selected.has(c));
     this.select(null);
     this.changed();
   }
 
   rotateSelection() {
-    const c = this.selection;
-    if (!c) return;
+    if (!this.selected.size) return;
     this.pushUndo();
-    if (isMos(c.type)) {
-      // rotate drain/source 90° clockwise around the gate
+    if (this.selected.size > 1) {
+      // rotate the whole group 90° clockwise around its (snapped) centroid
+      let sx = 0, sy = 0, n = 0;
+      for (const c of this.selected) {
+        for (const [gx, gy] of terminalsOf(c)) { sx += gx; sy += gy; n++; }
+      }
+      const cx = Math.round(sx / n), cy = Math.round(sy / n);
+      const rot = (x, y) => ({ x: cx - (y - cy), y: cy + (x - cx) });
+      for (const c of this.selected) {
+        const p1 = rot(c.x1, c.y1), p2 = rot(c.x2, c.y2);
+        c.x1 = p1.x; c.y1 = p1.y; c.x2 = p2.x; c.y2 = p2.y;
+        if (is3Term(c.type)) {
+          const p3 = rot(c.x3, c.y3);
+          c.x3 = p3.x; c.y3 = p3.y;
+        }
+      }
+      this.changed();
+      return;
+    }
+    const c = this.selection;
+    if (is3Term(c.type)) {
+      // rotate terminals 2 and 3 90° clockwise around the anchor terminal
       const rot = (x, y) => ({ x: c.x1 - (y - c.y1), y: c.y1 + (x - c.x1) });
       const d = rot(c.x2, c.y2), s = rot(c.x3, c.y3);
       c.x2 = d.x; c.y2 = d.y; c.x3 = s.x; c.y3 = s.y;
@@ -179,13 +219,17 @@ export class Editor {
     this.changed();
   }
 
+  selectAll() {
+    this.selectMany(this.components);
+  }
+
   // ---------- hit testing ----------
 
   hitTest(mx, my) {
     for (let i = this.components.length - 1; i >= 0; i--) {
       const c = this.components[i];
-      if (isMos(c.type)) {
-        const cx = (c.x2 + c.x3) / 2 * CELL, cy = (c.y2 + c.y3) / 2 * CELL;
+      if (is3Term(c.type)) {
+        const cx = (c.x1 + c.x2 + c.x3) / 3 * CELL, cy = (c.y1 + c.y2 + c.y3) / 3 * CELL;
         if (segDist(mx, my, c.x1 * CELL, c.y1 * CELL, cx, cy) < HIT_DIST ||
             segDist(mx, my, c.x2 * CELL, c.y2 * CELL, cx, cy) < HIT_DIST ||
             segDist(mx, my, c.x3 * CELL, c.y3 * CELL, cx, cy) < HIT_DIST) return c;
@@ -197,10 +241,65 @@ export class Editor {
   }
 
   hitEndpoint(mx, my, c) {
-    if (!c || isMos(c.type)) return 0; // MOSFET footprint is rigid — move/rotate only
+    if (!c || is3Term(c.type)) return 0; // 3-terminal footprints are rigid — move/rotate only
     if (Math.hypot(mx - c.x1 * CELL, my - c.y1 * CELL) < HIT_DIST + 2) return 1;
     if (c.type !== 'ground' && Math.hypot(mx - c.x2 * CELL, my - c.y2 * CELL) < HIT_DIST + 2) return 2;
     return 0;
+  }
+
+  // ---------- palette drag-and-drop ----------
+
+  clientToGrid(cx, cy) {
+    const r = this.canvas.getBoundingClientRect();
+    return {
+      x: Math.round((cx - r.left) / CELL),
+      y: Math.round((cy - r.top) / CELL),
+      inside: cx >= r.left && cx <= r.right && cy >= r.top && cy <= r.bottom,
+    };
+  }
+
+  beginPaletteDrag(type) {
+    this.drag = { kind: 'place', type, g1: null, g2: null, external: true, inside: false };
+  }
+
+  movePaletteDrag(cx, cy) {
+    const d = this.drag;
+    if (!d || !d.external) return;
+    const g = this.clientToGrid(cx, cy);
+    d.inside = g.inside;
+    if (d.type === 'ground') {
+      d.g1 = { x: g.x, y: g.y };
+      d.g2 = { x: g.x, y: g.y + 1 };
+    } else if (is3Term(d.type)) {
+      d.g1 = { x: g.x - 2, y: g.y }; // anchor sits left so the cursor rides near the body
+      d.g2 = d.g1;
+    } else {
+      d.g1 = { x: g.x - 2, y: g.y };
+      d.g2 = { x: g.x + 2, y: g.y };
+    }
+  }
+
+  dropPaletteDrag(cx, cy) {
+    const d = this.drag;
+    this.drag = null;
+    if (!d || !d.external || !d.g1) return false;
+    if (!this.clientToGrid(cx, cy).inside) return false;
+    this.pushUndo();
+    let comp;
+    if (is3Term(d.type)) {
+      comp = makeComponent(d.type, d.g1.x, d.g1.y, 0, 0);
+      Object.assign(comp, footprint3(d.type, d.g1.x, d.g1.y, 'e'));
+    } else {
+      comp = makeComponent(d.type, d.g1.x, d.g1.y, d.g2.x, d.g2.y);
+    }
+    this.components.push(comp);
+    this.select(comp);
+    this.changed();
+    return true;
+  }
+
+  cancelPaletteDrag() {
+    if (this.drag?.external) this.drag = null;
   }
 
   // ---------- pointer handling ----------
@@ -219,13 +318,23 @@ export class Editor {
         return;
       }
       const c = this.hitTest(mx, my);
-      this.select(c);
       if (c) {
+        if (e.shiftKey) {
+          this.toggleSelect(c);
+          return;
+        }
+        if (!this.selected.has(c)) this.select(c);
         this.pushUndo();
         this.drag = {
           kind: 'move', c, start: g, moved: false,
-          orig: { x1: c.x1, y1: c.y1, x2: c.x2, y2: c.y2, x3: c.x3, y3: c.y3 },
+          origs: [...this.selected].map(m => ({
+            c: m, x1: m.x1, y1: m.y1, x2: m.x2, y2: m.y2, x3: m.x3, y3: m.y3,
+          })),
         };
+      } else {
+        // empty canvas: start a rubber-band selection
+        if (!e.shiftKey) this.select(null);
+        this.drag = { kind: 'marquee', x0: mx, y0: my, x1: mx, y1: my, additive: e.shiftKey };
       }
     } else {
       this.drag = { kind: 'place', type: this.tool, g1: g, g2: g };
@@ -245,16 +354,20 @@ export class Editor {
     }
 
     if (d.kind === 'place') {
-      d.g2 = (d.type === 'ground' || isMos(d.type))
+      d.g2 = (d.type === 'ground' || is3Term(d.type))
         ? g
         : snapDir(d.g1.x, d.g1.y, g.x, g.y);
     } else if (d.kind === 'move') {
       const ddx = g.x - d.start.x, ddy = g.y - d.start.y;
       if (ddx || ddy) d.moved = true;
-      const c = d.c;
-      c.x1 = d.orig.x1 + ddx; c.y1 = d.orig.y1 + ddy;
-      c.x2 = d.orig.x2 + ddx; c.y2 = d.orig.y2 + ddy;
-      if (isMos(c.type)) { c.x3 = d.orig.x3 + ddx; c.y3 = d.orig.y3 + ddy; }
+      for (const o of d.origs) {
+        const c = o.c;
+        c.x1 = o.x1 + ddx; c.y1 = o.y1 + ddy;
+        c.x2 = o.x2 + ddx; c.y2 = o.y2 + ddy;
+        if (is3Term(c.type)) { c.x3 = o.x3 + ddx; c.y3 = o.y3 + ddy; }
+      }
+    } else if (d.kind === 'marquee') {
+      d.x1 = mx; d.y1 = my;
     } else if (d.kind === 'endpoint') {
       const c = d.c;
       const fx = d.end === 1 ? c.x2 : c.x1;
@@ -276,9 +389,9 @@ export class Editor {
       if (d.type === 'ground') {
         if (g1.x === g2.x && g1.y === g2.y) g2 = { x: g1.x, y: g1.y + 1 };
         this.components.push(makeComponent('ground', g1.x, g1.y, g2.x, g2.y));
-      } else if (isMos(d.type)) {
+      } else if (is3Term(d.type)) {
         const c = makeComponent(d.type, g1.x, g1.y, 0, 0);
-        Object.assign(c, mosfetFootprint(g1.x, g1.y, cardinalDir(g1.x, g1.y, g2.x, g2.y)));
+        Object.assign(c, footprint3(d.type, g1.x, g1.y, cardinalDir(g1.x, g1.y, g2.x, g2.y)));
         this.components.push(c);
       } else {
         if (g1.x === g2.x && g1.y === g2.y) g2 = { x: g1.x + 4, y: g1.y }; // plain click → default footprint
@@ -293,9 +406,20 @@ export class Editor {
         this.changed();
       } else {
         this.undoStack.pop();
+        // clicking one part of a group without dragging collapses to just it
+        if (this.selected.size > 1) this.select(d.c);
       }
     } else if (d.kind === 'endpoint' && !d.moved) {
       this.undoStack.pop();
+    } else if (d.kind === 'marquee') {
+      const x0 = Math.min(d.x0, d.x1), x1 = Math.max(d.x0, d.x1);
+      const y0 = Math.min(d.y0, d.y1), y1 = Math.max(d.y0, d.y1);
+      if (x1 - x0 > 3 || y1 - y0 > 3) {
+        const inside = this.components.filter(c =>
+          terminalsOf(c).every(([gx, gy]) =>
+            gx * CELL >= x0 && gx * CELL <= x1 && gy * CELL >= y0 && gy * CELL <= y1));
+        this.selectMany(d.additive ? [...this.selected, ...inside] : inside);
+      }
     } else {
       this.changed();
     }
@@ -334,7 +458,7 @@ export class Editor {
     }
 
     for (const c of this.components) {
-      renderComponent(ctx, c, vScale, c === this.selection);
+      renderComponent(ctx, c, vScale, this.selected.has(c));
     }
 
     this.drawJunctions(ctx, vScale);
@@ -343,9 +467,9 @@ export class Editor {
     if (running) this.advanceDots(frameDt);
     ctx.fillStyle = '#ffd24a';
     for (const c of this.components) {
-      if (c.type === 'ground' || !c._i || Math.abs(c._i) < 1e-7) continue;
-      // MOSFET channel current flows drain → source
-      const [ax, ay, bx, by] = isMos(c.type)
+      if (c.type === 'ground' || c.type === 'opamp' || !c._i || Math.abs(c._i) < 1e-7) continue;
+      // transistor channel current flows terminal 2 → terminal 3 (D→S / C→E)
+      const [ax, ay, bx, by] = (is3Term(c.type) && c.type !== 'potentiometer')
         ? [c.x2, c.y2, c.x3, c.y3]
         : [c.x1, c.y1, c.x2, c.y2];
       const x1 = ax * CELL, y1 = ay * CELL, x2 = bx * CELL, y2 = by * CELL;
@@ -370,13 +494,25 @@ export class Editor {
 
     this.drawConnectHints(ctx);
 
+    // rubber-band selection rectangle
+    if (this.drag && this.drag.kind === 'marquee') {
+      const m = this.drag;
+      ctx.fillStyle = 'rgba(87,157,255,0.10)';
+      ctx.strokeStyle = 'rgba(87,157,255,0.7)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([5, 4]);
+      ctx.fillRect(m.x0, m.y0, m.x1 - m.x0, m.y1 - m.y0);
+      ctx.strokeRect(m.x0, m.y0, m.x1 - m.x0, m.y1 - m.y0);
+      ctx.setLineDash([]);
+    }
+
     // placement ghost
     const d = this.drag;
-    if (d && d.kind === 'place') {
+    if (d && d.kind === 'place' && d.g1 && (!d.external || d.inside)) {
       ctx.globalAlpha = 0.55;
-      if (isMos(d.type)) {
-        const f = mosfetFootprint(d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
-        drawMosfet(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
+      if (is3Term(d.type)) {
+        const f = footprint3(d.type, d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
+        drawThreeTerm(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
           f.x2 * CELL, f.y2 * CELL, f.x3 * CELL, f.y3 * CELL, {});
       } else {
         drawShape(ctx, d.type, d.g1.x * CELL, d.g1.y * CELL,
@@ -425,15 +561,16 @@ export class Editor {
     let active = [];
     let exclude = null;
     if (d.kind === 'move') {
-      active = terminalsOf(d.c).map(([x, y]) => [x, y]);
-      exclude = d.c;
+      active = d.origs.flatMap(o => terminalsOf(o.c).map(([x, y]) => [x, y]));
+      exclude = this.selected;
     } else if (d.kind === 'endpoint') {
       const c = d.c;
       active = [d.end === 1 ? [c.x1, c.y1] : [c.x2, c.y2]];
       exclude = c;
     } else if (d.kind === 'place') {
-      if (isMos(d.type)) {
-        const f = mosfetFootprint(d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
+      if (!d.g1 || (d.external && !d.inside)) return;
+      if (is3Term(d.type)) {
+        const f = footprint3(d.type, d.g1.x, d.g1.y, cardinalDir(d.g1.x, d.g1.y, d.g2.x, d.g2.y));
         active = [[d.g1.x, d.g1.y], [f.x2, f.y2], [f.x3, f.y3]];
       } else if (d.type === 'ground') {
         active = [[d.g1.x, d.g1.y]];
@@ -444,7 +581,7 @@ export class Editor {
     if (!active.length) return;
     const others = new Set();
     for (const c of this.components) {
-      if (c === exclude) continue;
+      if (exclude && (exclude === c || (exclude instanceof Set && exclude.has(c)))) continue;
       for (const [gx, gy] of terminalsOf(c)) others.add(gx + ',' + gy);
     }
     ctx.strokeStyle = '#3ddc84';
